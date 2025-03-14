@@ -229,9 +229,10 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
-def initialize_tree(input_ids, model, past_key_values, logits_processor):
+def initialize_tree(input_ids, model, past_key_values, logits_processor, embed_model, pixel_values, image_sizes):
+    input_embeds = embed_model(input_ids, pixel_values=pixel_values, image_sizes=image_sizes)
     outputs, orig, hidden_states = model(
-        input_ids, past_key_values=past_key_values, output_orig=True
+        inputs_embeds=input_embeds, past_key_values=past_key_values, output_orig=True
     )
 
     if logits_processor is not None:
@@ -243,9 +244,11 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
         token = torch.argmax(orig[:, -1])
         token = token[None, None]
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
+    new_embeds = embed_model(token)
+    input_embeds = torch.cat((input_embeds, new_embeds), dim=1).to(input_embeds.device)
     # Clone the output hidden states
 
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor)
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor, input_embeds)
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
@@ -416,8 +419,7 @@ def update_inference_inputs(
         current_length_data,
         model,
         hidden_state_new,
-        sample_p
-):
+        sample_p):
     prev_input_len = input_ids.shape[1]
     # Map the best candidate indices to the original indices in the sequence
     select_indices = (

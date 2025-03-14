@@ -10,6 +10,10 @@ except:
     from eagle.model.ea_model import EaModel
 import torch
 from fastchat.model import get_conversation_template
+from transformers import LlavaNextProcessor
+from PIL import Image
+import requests
+
 import re
 
 
@@ -75,23 +79,25 @@ def highlight_text(text, text_list,color="black"):
 
 
 def warmup(model):
-    conv = get_conversation_template(args.model_type)
+    #url = "https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true"
+    #image = Image.open(requests.get(url, stream=True).raw)
 
-    if args.model_type == "llama-2-chat":
-        sys_p = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
-        conv.system_message = sys_p
-    elif args.model_type == "mixtral":
-        conv = get_conversation_template("llama-2-chat")
-        conv.system_message = ''
-        conv.sep2 = "</s>"
-    conv.append_message(conv.roles[0], "Hello")
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
-    if args.model_type == "llama-2-chat":
-        prompt += " "
-    input_ids = model.tokenizer([prompt]).input_ids
-    input_ids = torch.as_tensor(input_ids).cuda()
-    for output_ids in model.ea_generate(input_ids):
+    # Define a chat histiry and use `apply_chat_template` to get correctly formatted prompt
+    # Each value in "content" has to be a list of dicts with types ("text", "image") 
+    conversation = [
+        {
+
+          "role": "user",
+          "content": [
+              {"type": "text", "text": "What is shown in this image?"}
+            ],
+        },
+    ]
+    prompt = model.processor.apply_chat_template(conversation, add_generation_prompt=True)
+
+    inputs = model.processor(text=prompt, return_tensors="pt").to("cuda:0")
+
+    for output_ids in model.ea_generate(inputs):
         ol=output_ids.shape[1]
 
 def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_state,):
@@ -100,50 +106,59 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
     pure_history = session_state.get("pure_history", [])
     assert args.model_type == "llama-2-chat" or "vicuna"
     conv = get_conversation_template(args.model_type)
+    messages = []
+    images = []
+    #if args.model_type == "llama-2-chat":
+    #    sys_p = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
+    #    conv.system_message = sys_p
+    #elif args.model_type == "mixtral":
+    #    conv = get_conversation_template("llama-2-chat")
+    #    conv.system_message = ''
+    #    conv.sep2 = "</s>"
+    #elif args.model_type == "llama-3-instruct":
+    #    messages = [
+    #        {"role": "system",
+    #         "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
+    #    ]
 
-    if args.model_type == "llama-2-chat":
-        sys_p = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."
-        conv.system_message = sys_p
-    elif args.model_type == "mixtral":
-        conv = get_conversation_template("llama-2-chat")
-        conv.system_message = ''
-        conv.sep2 = "</s>"
-    elif args.model_type == "llama-3-instruct":
-        messages = [
-            {"role": "system",
-             "content": "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."},
-        ]
-
-    for query, response in pure_history:
-        if args.model_type == "llama-3-instruct":
+    for queries, response in pure_history:
+        query, image = queries
+        if image is None:
+            messages.append({
+                    "role": "user",
+                    "content": [
+                              {"type": "text", "text": query},
+                            ]
+                })
+            if response!=None:
+                messages.append({
+                        "role": "assistant",
+                        "content": response
+                    })
+        else:
             messages.append({
                 "role": "user",
-                "content": query
+                "content": [
+                              {"type": "text", "text": "What is shown in this image?"},
+                              {"type": "image"},
+                            ]
             })
             if response!=None:
                 messages.append({
                     "role": "assistant",
                     "content": response
                 })
-        else:
-            conv.append_message(conv.roles[0], query)
-            if args.model_type == "llama-2-chat" and response:
-                response = " " + response
-            conv.append_message(conv.roles[1], response)
-
-    if args.model_type == "llama-3-instruct":
-        prompt = model.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+            images.append(Image.open(image))
+    
+    prompt = model.processor.apply_chat_template(messages, add_generation_prompt=True)
+    if len(images) == 0:
+        inputs = model.processor(text=prompt, return_tensors="pt")
     else:
-        prompt = conv.get_prompt()
+        print(images, len(images))
+        inputs = model.processor(images=images, text=prompt, return_tensors="pt").to("cuda:0")
+    print(inputs)
 
-    if args.model_type == "llama-2-chat":
-        prompt += " "
-
-    input_ids = model.tokenizer([prompt]).input_ids
+    input_ids = inputs.input_ids
     input_ids = torch.as_tensor(input_ids).cuda()
     input_len = input_ids.shape[1]
     naive_text = []
@@ -153,7 +168,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
     total_ids=0
     if use_EaInfer:
 
-        for output_ids in model.ea_generate(input_ids, temperature=temperature, top_p=top_p,
+        for output_ids in model.ea_generate(inputs, temperature=temperature, top_p=top_p,
                                             max_new_tokens=args.max_new_token,is_llama3=args.model_type=="llama-3-instruct"):
             totaltime+=(time.time()-start_time)
             total_ids+=1
@@ -182,7 +197,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
 
 
     else:
-        for output_ids in model.naive_generate(input_ids, temperature=temperature, top_p=top_p,
+        for output_ids in model.naive_generate(inputs, temperature=temperature, top_p=top_p,
                                             max_new_tokens=args.max_new_token,is_llama3=args.model_type=="llama-3-instruct"):
             totaltime += (time.time() - start_time)
             total_ids+=1
@@ -206,11 +221,11 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             start_time = time.time()
 
 
-def user(user_message, history,session_state):
+def user(user_message, user_image, history,session_state):
     if history==None:
         history=[]
     pure_history = session_state.get("pure_history", [])
-    pure_history += [[user_message, None]]
+    pure_history += [[(user_message, user_image), None]]
     session_state["pure_history"] = pure_history
     return "", history + [[user_message, None]],session_state
 
@@ -257,13 +272,13 @@ parser.add_argument("--model-type", type=str, default="llama-3-instruct",choices
 parser.add_argument(
     "--total-token",
     type=int,
-    default=60,
+    default=8,
     help="The maximum number of new generated tokens.",
 )
 parser.add_argument(
     "--max-new-token",
     type=int,
-    default=512,
+    default=5120,
     help="The maximum number of new generated tokens.",
 )
 args = parser.parse_args()
@@ -305,19 +320,21 @@ with gr.Blocks(css=custom_css) as demo:
 
     chatbot = gr.Chatbot(height=600,show_label=False)
 
+    with gr.Row():
+        msg = gr.Textbox(label="输入文本")
+        user_image = gr.Image(label="上传图片", type="filepath")  # 支持图片输入
 
-    msg = gr.Textbox(label="Your input")
     with gr.Row():
         send_button = gr.Button("Send")
         stop_button = gr.Button("Stop")
         regenerate_button = gr.Button("Regenerate")
         clear_button = gr.Button("Clear")
-    enter_event=msg.submit(user, [msg, chatbot,gs], [msg, chatbot,gs], queue=True).then(
+    enter_event=msg.submit(user, [msg, user_image, chatbot,gs], [msg, chatbot,gs], queue=True).then(
         bot, [chatbot, temperature, top_p, use_EaInfer, highlight_EaInfer,gs], [chatbot,speed_box,compression_box,gs]
     )
     clear_button.click(clear, [chatbot,gs], [chatbot,speed_box,compression_box,gs], queue=True)
 
-    send_event=send_button.click(user, [msg, chatbot,gs], [msg, chatbot,gs],queue=True).then(
+    send_event=send_button.click(user, [msg,user_image, chatbot,gs], [msg, chatbot,gs],queue=True).then(
         bot, [chatbot, temperature, top_p, use_EaInfer, highlight_EaInfer,gs], [chatbot,speed_box,compression_box,gs]
     )
     regenerate_event=regenerate_button.click(regenerate, [chatbot,gs], [chatbot, msg,speed_box,compression_box,gs],queue=True).then(

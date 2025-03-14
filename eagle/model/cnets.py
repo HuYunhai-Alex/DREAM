@@ -402,6 +402,7 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
             self,
             hidden_states: torch.Tensor,
+            last_hidden_states: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -467,6 +468,153 @@ class I(nn.Module):
 def len_list(x, n):
     return [i for i in x if len(i) <= n]
 
+class LlamaCrossAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(
+        self,
+        config = None,
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.num_heads = self.config.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
+        self.dropout = config.dropout if hasattr(config, "dropout") else 0.0
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // self.num_heads
+        self.layer_idx = layer_idx
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cross_attention_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+        use_cache: bool = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_norm(query_states)
+
+        if cross_attention_states is not None:
+            #print("a")
+            key_states = self.k_proj(cross_attention_states)
+            value_states = self.v_proj(cross_attention_states)
+            key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            key_states = self.k_norm(key_states)
+            if past_key_value is not None:
+            # reuse k, v, self_attention
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+            past_key_value = (key_states, value_states) if use_cache else None
+            #print(f"past_key_value: {past_key_value}, use_cache: {use_cache}, key_states: {key_states.shape}, value_states: {value_states.shape}")
+        
+        elif cache_position[0] != 0:
+            key_states, value_states = (
+                past_key_value.key_cache[self.layer_idx],
+                past_key_value.value_cache[self.layer_idx],
+            )
+        else:
+            raise ValueError(
+                "Cross attention layer can't find neither `cross_attn_states` nor cached values for key/values!"
+            )
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:  # no matter the length, we just slice it
+            #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
+            attention_mask = attention_mask.clone(memory_format=torch.contiguous_format)
+            # 使用 in-place 操作将最后一维索引为 1 的位置置为 0
+            attention_mask[..., 0].fill_(torch.finfo(attention_mask.dtype).min)
+            #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+class LlamaCrossAttentionDecoderLayer(torch.nn.Module):
+    """Cross-attention transformer block with tanh-gated attention and feedforward."""
+
+    def __init__(self, config, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.cross_attn = LlamaCrossAttention(config, layer_idx=layer_idx)
+
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_attn_attn_gate = torch.nn.Parameter(torch.zeros(1))
+
+        self.mlp = LlamaMLP(config)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cross_attn_mlp_gate = torch.nn.Parameter(torch.zeros(1))
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cross_attention_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states, attn_weights, past_key_value = self.cross_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            cross_attention_states=cross_attention_states,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            cache_position=cache_position,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + self.cross_attn_attn_gate.tanh() * hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + self.cross_attn_mlp_gate.tanh() * hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        if use_cache:
+            outputs += (past_key_value,)
+
+        return outputs
 
 class Model(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
@@ -507,8 +655,8 @@ class Model(nn.Module):
         # print("top_k",top_k)
         # print("threshold",threshold)
 
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
+        self.layers = nn.ModuleList([LlamaCrossAttentionDecoderLayer(config, 0)] + [LlamaDecoderLayer(config, index) for index in range(1, config.num_hidden_layers+1)])
+        #self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
         for param in self.embed_tokens.parameters():
@@ -557,7 +705,7 @@ class Model(nn.Module):
     def forward(
             self,
             hidden_states,
-            input_ids,
+            input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
             past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -569,11 +717,13 @@ class Model(nn.Module):
             std=None
     ):
         batch_size, seq_length, _ = hidden_states.shape
+        last_hidden_states = hidden_states
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        with torch.no_grad():
-            inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None and input_ids is not None:
+            with torch.no_grad():
+                inputs_embeds = self.embed_tokens(input_ids)
             # inputs_embeds = inputs_embeds.detach()
 
         # if std is not None:
@@ -607,8 +757,9 @@ class Model(nn.Module):
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-        hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
-
+        hidden_states = inputs_embeds
+        #hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+        
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
 
@@ -630,12 +781,14 @@ class Model(nn.Module):
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states,
+                    last_hidden_states,
                     attention_mask,
                     position_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    last_hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
@@ -657,7 +810,7 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, input_embeds=None):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -669,8 +822,15 @@ class Model(nn.Module):
         scores_list = []
         parents_list = []
         ss_token = []
-
-        input_ids = input_ids[:, 1:]
+        
+        if hasattr(self, "stable_kv") and self.stable_kv is not None:
+            pass
+        else:
+            print("init hidden state")
+            zero_padding = torch.zeros(hidden_states.shape[0], 1, hidden_states.shape[2], device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states = torch.cat((hidden_states, zero_padding), dim=1)
+            
+        # input_ids = input_ids[:, 1:]
         input_ids = input_ids.to(hidden_states.device)
 
         len_posi = input_ids.shape[1]
@@ -682,7 +842,10 @@ class Model(nn.Module):
             out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+            print("init draft adapter")
+            #todo: vision encoder
+            #inputs_embeds = embed_model(input_ids)
+            out_hidden, past_key_values = self(hidden_states, inputs_embeds=input_embeds, use_cache=True)
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 

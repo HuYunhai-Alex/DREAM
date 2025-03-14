@@ -136,10 +136,7 @@ The inference code we provide automatically allocates model weights (loading a m
 ### With UI
 We have provided a suggested web interface, which you can use by running the following command. After the model is fully loaded, a URL will be output in the terminal, which you can enter into your browser to access.
 ```bash
-python -m eagle.application.webui --ea-model-path [path of EAGLE weight]\ 
-		--base-model-path [path of the original model]\
-		--model-type [vicuna\llama2\llama3]\
-        --total-token [int]
+python -m eagle.application.webui --ea-model-path /home/apc/models/EAGLE-Vicuna-7B-v1.3 --base-model-path /home/apc/models/vicuna-7b-v1.3 --model-type vicuna --total-token 8
 ```
 The *total-token* is the number of draft tokens. For smaller models and advanced GPUs, this value can be set larger. Adjusting according to the specific device and model can achieve better results. If set to -1, EAGLE-2 will automatically configure this parameter.
 

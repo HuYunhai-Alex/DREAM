@@ -13,6 +13,9 @@ from transformers import PreTrainedModel, PretrainedConfig,AutoConfig
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+from .modeling_llava_next import LlavaNextForConditionalGeneration
+
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
@@ -38,12 +41,15 @@ class EaModel(nn.Module):
     ):
 
         super().__init__()
+        self.embed_model = base_model
+        base_model = base_model.language_model
         self.base_model = base_model
         self.config = base_model.config
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path,use_fast=False)
+        self.processor = LlavaNextProcessor.from_pretrained(self.base_model_name_or_path)
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path,"r") as f:
             con=json.loads(f.read())
@@ -65,7 +71,7 @@ class EaModel(nn.Module):
 
         else:
             self.ea_layer.diff_device = False
-        self.ea_layer.load_state_dict(ea_layer_state_dict, strict=True)
+        self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
@@ -83,9 +89,9 @@ class EaModel(nn.Module):
             Type="LLaMA",
             base_model_path=None,
             ea_model_path=None,
-            total_token=59,
-            depth=5,
-            top_k=10,
+            total_token=8,
+            depth=3,
+            top_k=2,
             threshold=1.0,
             **kwargs,
     ):
@@ -99,8 +105,12 @@ class EaModel(nn.Module):
             base_model=KVQwen2ForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
-        else:
+        elif Type=='MixtralForCausalLM':
             base_model = KVMixtralForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
+        elif Type=='LlavaNextForConditionalGeneration':
+            base_model = LlavaNextForConditionalGeneration.from_pretrained(
                 base_model_path, **kwargs
             )
 
@@ -163,6 +173,7 @@ class EaModel(nn.Module):
     def forward(
             self,
             input_ids=None,
+            inputs_embeds=None,
             attention_mask=None,
             past_key_values=None,
             output_orig=False,
@@ -173,6 +184,7 @@ class EaModel(nn.Module):
             # Pass input through the base model
             outputs = self.base_model.model(
                 input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
@@ -189,7 +201,7 @@ class EaModel(nn.Module):
     @torch.no_grad()
     def eagenerate(
             self,
-            input_ids,
+            inputs,
             temperature=0.0,
             top_p=0.0,
             top_k=0.0,
@@ -199,6 +211,10 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
+        input_ids = inputs.input_ids.to(self.base_model.device)
+        pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
+        image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
+        
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -236,7 +252,7 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
+            input_ids, self, past_key_values, logits_processor, self.embed_model, pixel_values, image_sizes
         )
         new_token = 0
 
@@ -275,7 +291,7 @@ class EaModel(nn.Module):
                 current_length_data,
                 self,
                 hidden_state_new,
-                sample_p
+                sample_p,
             )
 
             if is_llama3:
@@ -297,7 +313,7 @@ class EaModel(nn.Module):
     @torch.no_grad()
     def naivegenerate(
             self,
-            input_ids,
+            inputs,
             temperature=0.0,
             top_p=0.0,
             top_k=0.0,
@@ -307,6 +323,9 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
+        input_ids = inputs.input_ids.to(self.base_model.device)
+        pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
+        image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length = max_length - self.ea_layer.total_tokens - 10
@@ -343,7 +362,8 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        input_embeds = self.embed_model(**inputs)
+        outputs = self.base_model(inputs_embeds=input_embeds, past_key_values=past_key_values, use_cache=True)
         new_token = 0
 
         for idx in range(max_length):
@@ -376,7 +396,7 @@ class EaModel(nn.Module):
     @torch.no_grad()
     def ea_generate(
             self,
-            input_ids,
+            inputs,
             temperature=0.0,
             top_p=0.0,
             top_k=0.0,
@@ -386,6 +406,10 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
+        input_ids = inputs.input_ids.to(self.base_model.device)
+        pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
+        image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
+        
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -423,7 +447,7 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
+            input_ids, self, past_key_values, logits_processor, self.embed_model, pixel_values, image_sizes
         )
         new_token = 0
 
@@ -462,7 +486,7 @@ class EaModel(nn.Module):
                 current_length_data,
                 self,
                 hidden_state_new,
-                sample_p
+                sample_p,
             )
 
             yield input_ids
@@ -482,7 +506,7 @@ class EaModel(nn.Module):
     @torch.no_grad()
     def naive_generate(
             self,
-            input_ids,
+            inputs,
             temperature=0.0,
             top_p=0.0,
             top_k=0.0,
@@ -492,6 +516,7 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
+        input_ids = inputs.input_ids.to(self.base_model.device)
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length = max_length - self.ea_layer.total_tokens - 10
@@ -526,7 +551,9 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
+        
+        input_embeds = self.embed_model(**inputs)
+        outputs = self.base_model(inputs_embeds=input_embeds, past_key_values=past_key_values, use_cache=True)
         new_token = 0
 
 
