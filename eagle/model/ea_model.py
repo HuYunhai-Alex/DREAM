@@ -89,9 +89,9 @@ class EaModel(nn.Module):
             Type="LLaMA",
             base_model_path=None,
             ea_model_path=None,
-            total_token=48,
+            total_token=16,
             depth=4,
-            top_k=12,
+            top_k=6,
             threshold=1.0,
             **kwargs,
     ):

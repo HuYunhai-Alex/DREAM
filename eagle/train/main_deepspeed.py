@@ -18,7 +18,7 @@ train_config = {
     "gradient_accumulation_steps": 1,
     "datapath": f"{args.tmpdir}",
     "is_warmup": True,
-    "num_epochs": 200,
+    "num_epochs": 20,
     "num_warmup_steps": 2000,
     "total_steps": 800000,
     "p_w": 1.0,
@@ -55,6 +55,7 @@ from configs import EConfig
 from typing import Any, Dict, List
 
 from torch import nn, optim
+from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 # import accelerate
@@ -135,7 +136,7 @@ class CustomDataset(Dataset):
         hidden_state = data['target'][:train_config["max_len"]]
         #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
         inputs_embeds = data['hidden_state_layer0'][:train_config["max_len"]]
-        hidden_state_mid = data['hidden_state_layer12'][:train_config["max_len"]]
+        hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
         loss_mask = data["loss_mask"][:train_config["max_len"]]
 
 
@@ -229,14 +230,16 @@ def compute_loss(target, target_p, predict, loss_mask):
     out_head = head_engine(predict)
     out_logp = nn.LogSoftmax(dim=2)(out_head)
     plogp = target_p * out_logp
-    ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.shape[0] * loss_mask.shape[1])
+    ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
     vloss = criterion(predict, target.to(rank))
-    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1])
-    return vloss, ploss, out_head
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
+    kldloss = F.kl_div(out_logp, target_p, reduction='none')
+    kldloss = torch.sum(torch.mean(loss_mask * kldloss, 2)) / (loss_mask.sum() + 1e-5)
+    return vloss, kldloss, out_head
 
 def compute_mid_loss(target, predict, loss_mask):
     vloss = criterion(predict, target.to(rank))
-    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1])
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
     return vloss
 
 if train_config["data_noise"]:
@@ -289,7 +292,7 @@ head_engine, _, test_loader, _ = deepspeed.initialize(args=args,
 for param in head.parameters():
     param.requires_grad = False
 
-for epoch in range(num_epochs):
+for epoch in range(3, num_epochs):
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0
