@@ -39,6 +39,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers import AutoModel, AutoModelForCausalLM
 from transformers.models.llava_next.configuration_llava_next import LlavaNextConfig
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from .modeling_mistral import MistralForCausalLM as KVMistralForCausalLM
 
 
 
@@ -368,7 +369,12 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel, GenerationMixi
         self.image_newline = nn.Parameter(torch.randn(config.text_config.hidden_size, dtype=self.dtype) * embed_std)
 
         self.vocab_size = config.text_config.vocab_size
-        self.language_model = KVLlamaForCausalLM._from_config(config.text_config)
+        
+        print(config)
+        if config.text_config.architectures[0] == "MistralForCausalLM":
+            self.language_model = KVMistralForCausalLM._from_config(config.text_config)
+        else:
+            self.language_model = KVLlamaForCausalLM._from_config(config.text_config)
         if self.language_model._tied_weights_keys is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in self.language_model._tied_weights_keys]
 

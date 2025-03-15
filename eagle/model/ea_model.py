@@ -323,7 +323,8 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
-        input_ids = inputs.input_ids.to(self.base_model.device)
+        inputs.to(self.base_model.device)
+        input_ids = inputs.input_ids
         pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
         image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
         if is_llama3:

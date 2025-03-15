@@ -133,7 +133,9 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             if response!=None:
                 messages.append({
                         "role": "assistant",
-                        "content": response
+                        "content": [
+                              {"type": "text", "text": response},
+                            ]
                     })
         else:
             messages.append({
@@ -146,16 +148,17 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             if response!=None:
                 messages.append({
                     "role": "assistant",
-                    "content": response
+                    "content": [
+                              {"type": "text", "text": response},
+                            ]
                 })
             images.append(Image.open(image))
     
     prompt = model.processor.apply_chat_template(messages, add_generation_prompt=True)
     if len(images) == 0:
-        inputs = model.processor(text=prompt, return_tensors="pt")
+        inputs = model.processor(text=prompt, return_tensors="pt").to(model.base_model.device)
     else:
-        print(images, len(images))
-        inputs = model.processor(images=images, text=prompt, return_tensors="pt").to("cuda:0")
+        inputs = model.processor(images=images, text=prompt, return_tensors="pt").to(model.base_model.device)
     print(inputs)
 
     input_ids = inputs.input_ids
@@ -190,6 +193,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             else:
                 history[-1][1] = text
             pure_history[-1][1] = text
+            print(pure_history)
             session_state["pure_history"] = pure_history
             new_tokens = cu_len-input_len
             yield history,f"{new_tokens/totaltime:.2f} tokens/s",f"{new_tokens/total_ids:.2f}",session_state
