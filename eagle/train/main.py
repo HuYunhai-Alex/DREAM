@@ -1,7 +1,7 @@
 import argparse
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
+parser.add_argument('--basepath', type=str, default='/home/apc/models/llava-v1.6-vicuna-7b-hf')
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--bs', type=int, default=4)
@@ -64,23 +64,19 @@ from tqdm import tqdm
 import numpy as np
 from transformers import get_linear_schedule_with_warmup, AutoConfig
 
-if accelerator.is_main_process:
-    import wandb
-
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
-
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
-head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
+print(baseconfig)
+head = torch.nn.Linear(baseconfig.text_config.max_position_embeddings, baseconfig.text_config.vocab_size, bias=False)
 
 try:
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
         index_json = json.loads(f.read())
-        head_path = index_json["weight_map"]["lm_head.weight"]
+        head_path = index_json["weight_map"]["language_model.lm_head.weight"]
     with safe_open(os.path.join(args.basepath, head_path),
                    framework="pt",
                    device="cpu") as f:
-        tensor_slice = f.get_slice("lm_head.weight")
+        tensor_slice = f.get_slice("language_model.lm_head.weight")
         vocab_size, hidden_dim = tensor_slice.get_shape()
         tensor = tensor_slice[:, :hidden_dim].float()
 except:
@@ -89,7 +85,7 @@ except:
         head_path = index_json["weight_map"]["lm_head.weight"]
     weights = torch.load(os.path.join(args.basepath, head_path))
     tensor = weights["lm_head.weight"].float()
-
+    
 head.weight.data = tensor
 head.eval()
 
@@ -143,30 +139,35 @@ class CustomDataset(Dataset):
         # try:
         data = torch.load(self.data[index])
         new_data = {}
-        hidden_state = data['hidden_state'][:train_config["max_len"]][None, :]
-        input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
+        hidden_state = data['hidden_state'][:train_config["max_len"]]
+        #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
+        inputs_embeds = data['inputs_embeds'][:train_config["max_len"]]
+        hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
+        loss_mask = data["loss_mask"][:train_config["max_len"]]
 
 
         length = hidden_state.shape[1]
         # length_q = data['query_ids'].shape[1]
         attention_mask = [1] * length
         loss_mask = loss_mask[0].tolist()
-        loss_mask[-1] = 0
+        # loss_mask[-1] = 0
 
-        input_ids_target = input_ids[:, 1:]
-        zeropadding = torch.tensor([[0]])
-        input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
+        #input_ids_target = input_ids[:, 1:]
+        #zeropadding = torch.tensor([[0]])
+        #input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
 
-        target = hidden_state[:, 1:, :]
+        target = hidden_state
         zeropadding = torch.zeros(1, 1, target.shape[2])
-        target = torch.cat((target, zeropadding), dim=1)
-        loss_mask[-1] = 0
+        #print(f"target shape: {target.shape}, hidden_state shape: {hidden_state.shape}, hidden_state_mid shape: {hidden_state_mid.shape}, loss_mask: {loss_mask}")
+        hidden_state = torch.cat((zeropadding, hidden_state[:,:-1,:]), dim=1)
+        #loss_mask[-1] = 0
         new_data["attention_mask"] = attention_mask
         new_data["loss_mask"] = loss_mask
         new_data["target"] = target
         new_data["hidden_state_big"] = hidden_state
-        new_data["input_ids"] = input_ids_target
+        new_data["hidden_state_mid"] = hidden_state_mid
+        #new_data["input_ids"] = input_ids_target
+        new_data["inputs_embeds"] = inputs_embeds
 
 
         if self.transform:
@@ -192,8 +193,10 @@ class DataCollatorWithPadding:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item['hidden_state_big'].shape[1] for item in features)
-        batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
+        # batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
+        batch_inputs_embeds = torch.cat([self.paddingtensor(item['inputs_embeds'], max_length) for item in features])
         batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length) for item in features])
+        batch_hidden_states_mid = torch.cat([self.paddingtensor(item['hidden_state_mid'], max_length) for item in features])
         batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
         batch_loss_mask = torch.tensor(
             [item['loss_mask'] + [0] * (max_length - len(item['loss_mask'])) for item in features])
@@ -202,8 +205,10 @@ class DataCollatorWithPadding:
         # batch_loss_mask = torch.ones_like(batch_loss_mask)
         # batch_attention_mask=torch.ones_like(batch_attention_mask)
         batch = {
-            "input_ids": batch_input_ids,
+            #"input_ids": batch_input_ids,
+            "inputs_embeds": batch_inputs_embeds,
             "hidden_states": batch_hidden_states,
+            "hidden_states_mid": batch_hidden_states_mid,
             "target": batch_target,
             "attention_mask": batch_attention_mask,
             "loss_mask": batch_loss_mask,
@@ -239,19 +244,23 @@ def compute_loss(target, target_p, predict, loss_mask):
 
 @torch.no_grad()
 def getkacc(model, data, head, max_length=5):
-    def generate(hidden_states, input_ids, head, max_length=4, use_cache=True):
+    def generate(hidden_states, inputs_embeds, head, max_length=4, use_cache=True):
+        input_ids = None
         if use_cache:
             past_key_values = None
             for i in range(max_length):
                 if past_key_values != None:
-                    out_hidden, past_key_values = model(last_hidden, input_ids=token, past_key_values=past_key_values,
+                    out_hidden, past_key_values = model(last_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                         use_cache=True)
                 else:
-                    out_hidden, past_key_values = model(hidden_states, input_ids=input_ids, use_cache=True)
+                    out_hidden, past_key_values = model(hidden_states, inputs_embeds=inputs_embeds, use_cache=True)
                 last_hidden = out_hidden[:, -1:]
                 last_headout = head(last_hidden)
                 token = torch.argmax(last_headout, dim=-1)
-                input_ids = torch.cat((input_ids, token), dim=1)
+                if input_ids is not None:
+                    input_ids = torch.cat((input_ids, token), dim=1)
+                else:
+                    input_ids = token
 
         else:
             raise NotImplementedError
@@ -259,7 +268,7 @@ def getkacc(model, data, head, max_length=5):
         return input_ids
 
     hidden_states = data["hidden_states"]
-    input_ids = data["input_ids"]
+    inputs_embeds = data["inputs_embeds"]
     loss_mask = data["loss_mask"]
     target = data["target"]
     total = [0 for _ in range(max_length)]
@@ -272,8 +281,8 @@ def getkacc(model, data, head, max_length=5):
         if loss_mask[:, pre_len].sum() == 0:
             continue
         pre_hidden_states = hidden_states[:, :pre_len]
-        pre_input_ids = input_ids[:, :pre_len]
-        outs = generate(pre_hidden_states, pre_input_ids, head, max_length=max_length)
+        pre_inputs_embeds = inputs_embeds[:, :pre_len]
+        outs = generate(pre_hidden_states, pre_inputs_embeds, head, max_length=max_length)
         generate_ids = outs[:, pre_len:]
         for bid in range(bs):
             for k in range(max_length):
@@ -349,10 +358,13 @@ for epoch in range(num_epochs + 1):
     num_batches = 0
     model.train()
     for batch_idx, data in enumerate(tqdm(train_loader)):
+        from torch.autograd import Variable
+        inputs_embeds = Variable(data["inputs_embeds"], requires_grad=True)
+        last_hidden_state = Variable(data["hidden_states"], requires_grad=True)
 
         with accelerator.accumulate(model):
             optimizer.zero_grad()
-            predict = model(data["hidden_states"], input_ids=data["input_ids"], attention_mask=data["attention_mask"])
+            predict = model(last_hidden_state, inputs_embeds=inputs_embeds, attention_mask=data["attention_mask"])
             with torch.no_grad():
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
@@ -384,9 +396,6 @@ for epoch in range(num_epochs + 1):
                        "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
             for id, i in enumerate(top_3acc):
                 logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
-            wandb.log(logdict)
-            # for id,i in enumerate(top_3acc):
-            #     wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
 
         del ploss, vloss
         epoch_loss += loss.item()
@@ -398,12 +407,8 @@ for epoch in range(num_epochs + 1):
     epoch_loss /= num_batches
     top_3acc = accelerator.gather_for_metrics(top_3acc)
     if accelerator.is_local_main_process:
-        for id, i in enumerate(top_3acc):
-            wandb.log({f'train/epochtop_{id + 1}_acc': i.sum().item() / total})
-    if accelerator.is_local_main_process:
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
         print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
-        wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})
 
     if (epoch + 1) % train_config["save_freq"]:
         top_3acc = [0 for _ in range(3)]
@@ -420,7 +425,7 @@ for epoch in range(num_epochs + 1):
                     acces = getkacc(model, data, head, max_length=5)
                     for i in range(len(acces)):
                         k_acc[i].append(acces[i])
-                predict = model(data["hidden_states"], input_ids=data["input_ids"],
+                predict = model(data["hidden_states"], inputs_embeds=data["inputs_embeds"],
                                 attention_mask=data["attention_mask"])
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
@@ -449,21 +454,14 @@ for epoch in range(num_epochs + 1):
             mean_acces.append(mean_acc)
 
         mean_acces = accelerator.gather_for_metrics(mean_acces)
-        if accelerator.is_local_main_process:
-            for id, i in enumerate(mean_acces):
-                mean_acc = i.mean().item()
-                wandb.log({f"test/{id}_acc": mean_acc})
 
         correct, total = torch.tensor(correct).cuda(), torch.tensor(total).cuda()
         correct, total = accelerator.gather_for_metrics((correct, total))
         correct, total = correct.sum().item(), total.sum().item()
         top_3acc = accelerator.gather_for_metrics(top_3acc)
-        if accelerator.is_local_main_process:
-            for id, i in enumerate(top_3acc):
-                wandb.log({f'test/top_{id + 1}_acc': i.sum().item() / total})
+
         epoch_loss /= num_batches
         if accelerator.is_local_main_process:
             print('Test Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
             print('Test Accuracy: {:.2f}%'.format(100 * correct / total))
-            wandb.log({"test/epochacc": correct / total, "test/epochloss": epoch_loss})
             accelerator.save_state(output_dir=f"{args.cpdir}/state_{epoch}")

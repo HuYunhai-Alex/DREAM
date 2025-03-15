@@ -631,19 +631,19 @@ class Model(nn.Module):
             try:
                 with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
                     index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                with safe_open(os.path.join(path, emb_path),
-                               framework="pt",
-                               device="cpu") as f:
-                    tensor_slice = f.get_slice("model.embed_tokens.weight")
+                    head_path = index_json["weight_map"]["language_model.lm_head.weight"]
+                with safe_open(os.path.join(path, head_path),
+                            framework="pt",
+                            device="cpu") as f:
+                    tensor_slice = f.get_slice("language_model.lm_head.weight")
                     vocab_size, hidden_dim = tensor_slice.get_shape()
                     tensor = tensor_slice[:, :hidden_dim].float()
             except:
                 with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
                     index_json = json.loads(f.read())
-                    emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
-                weights = torch.load(os.path.join(path, emb_path))
-                tensor = weights["model.embed_tokens.weight"].float()
+                    head_path = index_json["weight_map"]["lm_head.weight"]
+                weights = torch.load(os.path.join(path, head_path))
+                tensor = weights["lm_head.weight"].float()
             self.embed_tokens.weight.data = tensor
 
         self.top_k = top_k
@@ -655,7 +655,7 @@ class Model(nn.Module):
         # print("top_k",top_k)
         # print("threshold",threshold)
 
-        self.layers = nn.ModuleList([LlamaCrossAttentionDecoderLayer(config, 0)] + [LlamaDecoderLayer(config, index) for index in range(1, config.num_hidden_layers+1)])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, 0), LlamaCrossAttentionDecoderLayer(config, 1), LlamaDecoderLayer(config, 2)])
         #self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
