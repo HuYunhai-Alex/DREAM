@@ -156,12 +156,12 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
     
     prompt = model.processor.apply_chat_template(messages, add_generation_prompt=True)
     if len(images) == 0:
-        inputs = model.processor(text=prompt, return_tensors="pt").to(model.base_model.device)
+        inputs = model.processor(text=prompt, truncation=True, return_tensors="pt").to(model.base_model.device)
     else:
-        inputs = model.processor(images=images, text=prompt, return_tensors="pt").to(model.base_model.device)
-    print(inputs)
-
+        inputs = model.processor(images=images, text=prompt, truncation=True, return_tensors="pt").to(model.base_model.device)
+    
     input_ids = inputs.input_ids
+    print(inputs.input_ids.shape)
     input_ids = torch.as_tensor(input_ids).cuda()
     input_len = input_ids.shape[1]
     naive_text = []
@@ -193,7 +193,6 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             else:
                 history[-1][1] = text
             pure_history[-1][1] = text
-            print(pure_history)
             session_state["pure_history"] = pure_history
             new_tokens = cu_len-input_len
             yield history,f"{new_tokens/totaltime:.2f} tokens/s",f"{new_tokens/total_ids:.2f}",session_state

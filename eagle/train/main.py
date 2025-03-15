@@ -1,10 +1,10 @@
 import argparse
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--basepath', type=str, default='/home/apc/models/llava-v1.6-vicuna-7b-hf')
+parser.add_argument('--basepath', type=str, default='/scratch/yh5961/models/llava-v1.6-vicuna-7b-hf')
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--lr', type=float, default=3e-5)
-parser.add_argument('--bs', type=int, default=4)
+parser.add_argument('--bs', type=int, default=1)
 parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
@@ -23,7 +23,7 @@ train_config = {
     "p_w": 0.1,
     "v_w": 1.0,
     "head_w": 0.1,
-    "num_workers": 2,
+    "num_workers": 4,
     "embeding": True,
     "act": "No",
     "data_noise": True,
@@ -139,9 +139,9 @@ class CustomDataset(Dataset):
         # try:
         data = torch.load(self.data[index])
         new_data = {}
-        hidden_state = data['hidden_state'][:train_config["max_len"]]
+        hidden_state = data['target'][:train_config["max_len"]]
         #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        inputs_embeds = data['inputs_embeds'][:train_config["max_len"]]
+        inputs_embeds = data['hidden_state_layer0'][:train_config["max_len"]]
         hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
         loss_mask = data["loss_mask"][:train_config["max_len"]]
 
@@ -320,9 +320,9 @@ traindataset = CustomDataset(traindatapath, transform=aug)
 testdataset = CustomDataset(testdatapath)
 train_loader = DataLoader(traindataset, batch_size=train_config["bs"], shuffle=True,
                           collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"],
-                          pin_memory=True)
+                          pin_memory=True, drop_last=True)
 test_loader = DataLoader(testdataset, batch_size=train_config["bs"], shuffle=False,
-                         collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True)
+                         collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True,  drop_last=True)
 
 if accelerator.is_main_process:
     if not os.path.exists(args.cpdir):
@@ -352,6 +352,7 @@ else:
     )
 # accelerator.load_state("checkpoints/state_5")
 for epoch in range(num_epochs + 1):
+    torch.cuda.empty_cache()
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0

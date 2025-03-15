@@ -659,6 +659,7 @@ class Model(nn.Module):
         #self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         for param in self.embed_tokens.parameters():
             param.requires_grad = False
 
@@ -801,8 +802,18 @@ class Model(nn.Module):
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
-        if use_cache:
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        
+        if use_cache and not output_hidden_states:
             return hidden_states, next_decoder_cache
+        elif use_cache and output_hidden_states:
+            return hidden_states, next_decoder_cache, all_hidden_states
+        elif not use_cache and output_hidden_states:
+            return hidden_states, all_hidden_states
 
         return hidden_states
 
