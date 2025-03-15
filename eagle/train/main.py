@@ -250,7 +250,8 @@ def getkacc(model, data, head, max_length=5):
             past_key_values = None
             for i in range(max_length):
                 if past_key_values != None:
-                    out_hidden, past_key_values = model(last_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                    # print(f"token shape: {token.shape}, hidden_states shape: {last_hidden.shape}")
+                    out_hidden, past_key_values = model(last_hidden, input_ids=token, past_key_values=past_key_values,
                                                         use_cache=True)
                 else:
                     out_hidden, past_key_values = model(hidden_states, inputs_embeds=inputs_embeds, use_cache=True)
@@ -283,7 +284,7 @@ def getkacc(model, data, head, max_length=5):
         pre_hidden_states = hidden_states[:, :pre_len]
         pre_inputs_embeds = inputs_embeds[:, :pre_len]
         outs = generate(pre_hidden_states, pre_inputs_embeds, head, max_length=max_length)
-        generate_ids = outs[:, pre_len:]
+        generate_ids = outs[:, :]
         for bid in range(bs):
             for k in range(max_length):
                 if loss_mask[bid, pre_len + k] == 0:

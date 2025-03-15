@@ -55,6 +55,8 @@ cover/
 *.mo
 *.pot
 *.ckpt
+*ckpt/
+
 
 # Django stuff:
 *.log

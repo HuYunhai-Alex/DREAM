@@ -4,6 +4,7 @@
   ],
   "bos_token_id": 1,
   "eos_token_id": 2,
+  "image_token_id": 32000,
   "hidden_act": "silu",
   "hidden_size": 4096,
   "initializer_range": 0.02,
@@ -18,6 +19,6 @@
   "torch_dtype": "float16",
   "transformers_version": "4.28.1",
   "use_cache": true,
-  "vocab_size": 32000,
+  "vocab_size": 32064,
   "dropout": 0.0
 }
