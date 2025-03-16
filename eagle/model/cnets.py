@@ -841,7 +841,7 @@ class Model(nn.Module):
         input_ids = topk_index
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.norm.device)
+        topk_cs_index = torch.arange(top_k, device=self.norm.weight.device)
 
         # 4
         for i in range(depth):
