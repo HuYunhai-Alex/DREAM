@@ -536,25 +536,14 @@ class LlamaCrossAttention(nn.Module):
             past_key_value = (key_states, value_states) if use_cache else None
             #print(f"past_key_value: {past_key_value[0].shape}, cache_position: {cache_position}, key_states: {key_states.shape}, value_states: {value_states.shape}, attention_mask {attention_mask.shape}")
         
-        elif cache_position[0] != 0:
-            key_states, value_states = (
-                past_key_value.key_cache[self.layer_idx],
-                past_key_value.value_cache[self.layer_idx],
-            )
         else:
-            raise ValueError(
-                "Cross attention layer can't find neither `cross_attn_states` nor cached values for key/values!"
-            )
+            key_states, value_states = past_key_value
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:  # no matter the length, we just slice it
             #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
-            attention_mask = attention_mask.clone(memory_format=torch.contiguous_format)
-            # 使用 in-place 操作将最后一维索引为 1 的位置置为 0
-            attention_mask[..., 0].fill_(torch.finfo(attention_mask.dtype).min)
-            #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            causal_mask = attention_mask[:, :, :,  1: ]
             attn_weights = attn_weights + causal_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -633,28 +622,6 @@ class Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        if load_emb:
-            from safetensors import safe_open
-            import json
-            try:
-                with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    head_path = index_json["weight_map"]["language_model.lm_head.weight"]
-                with safe_open(os.path.join(path, head_path),
-                            framework="pt",
-                            device="cpu") as f:
-                    tensor_slice = f.get_slice("language_model.lm_head.weight")
-                    vocab_size, hidden_dim = tensor_slice.get_shape()
-                    tensor = tensor_slice[:, :hidden_dim].float()
-            except:
-                with open(os.path.join(path, "pytorch_model.bin.index.json"), "r") as f:
-                    index_json = json.loads(f.read())
-                    head_path = index_json["weight_map"]["lm_head.weight"]
-                weights = torch.load(os.path.join(path, head_path))
-                tensor = weights["lm_head.weight"].float()
-            self.embed_tokens.weight.data = tensor
-
         self.top_k = top_k
         self.total_tokens = total_tokens - 1
         self.depth = depth
@@ -669,13 +636,11 @@ class Model(nn.Module):
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        for param in self.embed_tokens.parameters():
-            param.requires_grad = False
 
     def init_tree(self):
-        self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
-        self.position_ids = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
-        self.tree_mask_init = self.tree_mask_init.to(self.embed_tokens.weight.device)
+        self.tree_mask_init = torch.eye(self.top_k, device=self.norm.weight.device)[None, None]
+        self.position_ids = torch.zeros(self.top_k, device=self.norm.weight.device, dtype=torch.long)
+        self.tree_mask_init = self.tree_mask_init.to(self.norm.weight.device)
 
     def reset(self):
         self.tree_mask = None
@@ -726,13 +691,14 @@ class Model(nn.Module):
             return_dict: Optional[bool] = None,
             std=None
     ):
-        batch_size, seq_length, _ = last_hidden_states.shape
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        else:
+            batch_size, seq_length, _ = inputs_embeds.shape
+            
         seq_length_with_past = seq_length
         past_key_values_length = 0
-
-        if inputs_embeds is None and input_ids is not None:
-            with torch.no_grad():
-                inputs_embeds = self.embed_tokens(input_ids)
+        
             # inputs_embeds = inputs_embeds.detach()
 
         # if std is not None:
@@ -743,7 +709,7 @@ class Model(nn.Module):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = last_hidden_states.device if last_hidden_states is not None else inputs_embeds.device
+            device = inputs_embeds.device
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
@@ -754,10 +720,10 @@ class Model(nn.Module):
         #position_ids=position_ids//4
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=last_hidden_states.device
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
             )
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), last_hidden_states, past_key_values_length
+            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
         )
         #print(attention_mask[0,0,0,:])
 
@@ -766,7 +732,6 @@ class Model(nn.Module):
         #        use_cache = False
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
-        inputs_embeds = inputs_embeds.to(last_hidden_states.dtype)
         hidden_states = inputs_embeds
         #hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
         
@@ -852,14 +817,14 @@ class Model(nn.Module):
         # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+            inputs_embeds = self.embed_model(input_ids[:, kv_len:])
+            out_hidden, past_key_values = self(hidden_states, inputs_embeds=inputs_embeds,
                                                past_key_values=self.stable_kv, use_cache=True)
         else:
-            print("init draft adapter")
             #todo: vision encoder
             #inputs_embeds = embed_model(input_ids)
-            zero_padding = torch.zeros(hidden_states.shape[0], 1, hidden_states.shape[2], device=hidden_states.device, dtype=hidden_states.dtype)
-            hidden_states = torch.cat((zero_padding, hidden_states), dim=1)
+            #zero_padding = torch.zeros(hidden_states.shape[0], 1, hidden_states.shape[2], device=hidden_states.device, dtype=hidden_states.dtype)
+            #hidden_states = torch.cat((zero_padding, hidden_states), dim=1)
             out_hidden, past_key_values = self(hidden_states, inputs_embeds=input_embeds, use_cache=True)
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
@@ -876,14 +841,15 @@ class Model(nn.Module):
         input_ids = topk_index
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        topk_cs_index = torch.arange(top_k, device=self.norm.device)
 
         # 4
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+            inputs_embeds = self.embed_model(input_ids)
+            out_hidden, past_key_values = self(input_hidden, inputs_embeds=inputs_embeds, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
             len_posi += 1
 
@@ -918,7 +884,6 @@ class Model(nn.Module):
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
-
             # if self.threshold < 0 and cu_scores.max() < self.threshold:
             #     break
 
@@ -932,7 +897,7 @@ class Model(nn.Module):
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
-
+        
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 

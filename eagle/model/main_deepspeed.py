@@ -32,7 +32,7 @@ train_config = {
     "mean": 0.0,
     "std": 0.2,
     "residual": "true,norm",
-    "max_len": 2048,
+    "max_len": 5120,
     "config_path": args.configpath,
     "b1": 0.9,
     "b2": 0.95,

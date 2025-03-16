@@ -425,7 +425,6 @@ def update_inference_inputs(
     select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
-    print(f"best_candidate {best_candidate}, accept_length {accept_length}")
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
@@ -454,7 +453,6 @@ def update_inference_inputs(
     else:
         token = torch.argmax(prob)
         token = token[None, None]
-    print(f"accept_hidden_state_new {accept_hidden_state_new.shape}")
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
                                               input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
