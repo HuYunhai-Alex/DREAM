@@ -28,6 +28,7 @@ import torch.utils.checkpoint
 from torch import nn
 
 from transformers.activations import ACT2FN
+from transformers import DynamicCache
 
 
 try:
@@ -509,7 +510,6 @@ class LlamaCrossAttention(nn.Module):
         query_states = self.q_proj(hidden_states)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         query_states = self.q_norm(query_states)
-
         if cross_attention_states is not None:
             #print("a")
             key_states = self.k_proj(cross_attention_states)
@@ -520,13 +520,21 @@ class LlamaCrossAttention(nn.Module):
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
             key_states = self.k_norm(key_states)
+            
+            #if past_key_value is not None:
+            #    cache = DynamicCache.from_legacy_cache([past_key_value])
+                # if we have a new image + new tokens, we only computed key_states on that new image
+                # we still update the cross key states, past_image, new_image. And use it!
+            #    key_states, value_states = cache.update(
+            #        key_states, value_states, 0, {"cache_position": cache_position}
+            #    )
             if past_key_value is not None:
             # reuse k, v, self_attention
                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
             past_key_value = (key_states, value_states) if use_cache else None
-            #print(f"past_key_value: {past_key_value}, use_cache: {use_cache}, key_states: {key_states.shape}, value_states: {value_states.shape}")
+            #print(f"past_key_value: {past_key_value[0].shape}, cache_position: {cache_position}, key_states: {key_states.shape}, value_states: {value_states.shape}, attention_mask {attention_mask.shape}")
         
         elif cache_position[0] != 0:
             key_states, value_states = (
@@ -546,7 +554,8 @@ class LlamaCrossAttention(nn.Module):
             # 使用 in-place 操作将最后一维索引为 1 的位置置为 0
             attention_mask[..., 0].fill_(torch.finfo(attention_mask.dtype).min)
             #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
-            attn_weights = attn_weights + attention_mask
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
@@ -596,7 +605,7 @@ class LlamaCrossAttentionDecoderLayer(torch.nn.Module):
             cross_attention_states=cross_attention_states,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
-            cache_position=cache_position,
+            cache_position=position_ids,
             use_cache=use_cache,
         )
         hidden_states = residual + self.cross_attn_attn_gate.tanh() * hidden_states
@@ -705,7 +714,7 @@ class Model(nn.Module):
 
     def forward(
             self,
-            hidden_states,
+            last_hidden_states,
             input_ids: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
@@ -717,8 +726,7 @@ class Model(nn.Module):
             return_dict: Optional[bool] = None,
             std=None
     ):
-        batch_size, seq_length, _ = hidden_states.shape
-        last_hidden_states = hidden_states
+        batch_size, seq_length, _ = last_hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
@@ -735,7 +743,7 @@ class Model(nn.Module):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
         if position_ids is None:
-            device = hidden_states.device if hidden_states is not None else inputs_embeds.device
+            device = last_hidden_states.device if last_hidden_states is not None else inputs_embeds.device
             position_ids = torch.arange(
                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
             )
@@ -746,18 +754,19 @@ class Model(nn.Module):
         #position_ids=position_ids//4
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=last_hidden_states.device
             )
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+            attention_mask, (batch_size, seq_length), last_hidden_states, past_key_values_length
         )
+        #print(attention_mask[0,0,0,:])
 
         # if self.gradient_checkpointing and self.training:
         #    if use_cache:
         #        use_cache = False
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
-        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        inputs_embeds = inputs_embeds.to(last_hidden_states.dtype)
         hidden_states = inputs_embeds
         #hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
         
@@ -833,13 +842,6 @@ class Model(nn.Module):
         scores_list = []
         parents_list = []
         ss_token = []
-        
-        if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            pass
-        else:
-            print("init hidden state")
-            zero_padding = torch.zeros(hidden_states.shape[0], 1, hidden_states.shape[2], device=hidden_states.device, dtype=hidden_states.dtype)
-            hidden_states = torch.cat((hidden_states, zero_padding), dim=1)
             
         # input_ids = input_ids[:, 1:]
         input_ids = input_ids.to(hidden_states.device)
@@ -856,6 +858,8 @@ class Model(nn.Module):
             print("init draft adapter")
             #todo: vision encoder
             #inputs_embeds = embed_model(input_ids)
+            zero_padding = torch.zeros(hidden_states.shape[0], 1, hidden_states.shape[2], device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states = torch.cat((zero_padding, hidden_states), dim=1)
             out_hidden, past_key_values = self(hidden_states, inputs_embeds=input_embeds, use_cache=True)
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]

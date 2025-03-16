@@ -244,7 +244,7 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, embed_m
         token = torch.argmax(orig[:, -1])
         token = token[None, None]
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-    new_embeds = embed_model(token)
+    new_embeds = embed_model(token.to(embed_model.device))
     input_embeds = torch.cat((input_embeds, new_embeds), dim=1).to(input_embeds.device)
     # Clone the output hidden states
 
@@ -425,19 +425,21 @@ def update_inference_inputs(
     select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
+    print(f"best_candidate {best_candidate}, accept_length {accept_length}")
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
+
     for past_key_values_data in past_key_values_data_list:
         tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
         # Destination tensor where the relevant past information will be stored
         dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
         # Copy relevant past information from the source to the destination
         dst.copy_(tgt, non_blocking=True)
-
+        
     # Update the current length tensor (currently only support batch size is 1)
     current_length_data.fill_(prev_input_len + tgt.shape[-2])
 
@@ -452,6 +454,7 @@ def update_inference_inputs(
     else:
         token = torch.argmax(prob)
         token = token[None, None]
+    print(f"accept_hidden_state_new {accept_hidden_state_new.shape}")
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
                                               input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),

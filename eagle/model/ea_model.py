@@ -71,7 +71,7 @@ class EaModel(nn.Module):
 
         else:
             self.ea_layer.diff_device = False
-        self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
+        self.ea_layer.load_state_dict(ea_layer_state_dict, strict=True)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
@@ -89,9 +89,9 @@ class EaModel(nn.Module):
             Type="LLaMA",
             base_model_path=None,
             ea_model_path=None,
-            total_token=16,
-            depth=4,
-            top_k=6,
+            total_token=6,
+            depth=8,
+            top_k=10,
             threshold=1.0,
             **kwargs,
     ):
@@ -262,6 +262,7 @@ class EaModel(nn.Module):
 
             draft_tokens=draft_tokens.to(input_ids.device)
             #with Timer("tree_decoding"):
+            print(self.tokenizer.decode(draft_tokens[0]))
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -402,7 +403,7 @@ class EaModel(nn.Module):
             top_p=0.0,
             top_k=0.0,
             max_new_tokens=512,
-            max_length=20480,
+            max_length=4096,
             log=False,
             is_llama3=False,
 
@@ -458,6 +459,8 @@ class EaModel(nn.Module):
 
             draft_tokens=draft_tokens.to(input_ids.device)
             #with Timer("tree_decoding"):
+            print("drfat token", [self.tokenizer.decode(token) for token in draft_tokens[0]], draft_tokens[0])
+
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,

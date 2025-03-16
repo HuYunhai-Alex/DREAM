@@ -141,7 +141,7 @@ def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_stat
             messages.append({
                 "role": "user",
                 "content": [
-                              {"type": "text", "text": "What is shown in this image?"},
+                              {"type": "text", "text": query},
                               {"type": "image"},
                             ]
             })

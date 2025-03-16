@@ -14,15 +14,15 @@ import json
 
 train_config = {
     "lr": 5e-5,
-    "bs": 4,
+    "bs": 2,
     "gradient_accumulation_steps": 1,
     "datapath": f"{args.tmpdir}",
     "is_warmup": True,
     "num_epochs": 20,
     "num_warmup_steps": 2000,
     "total_steps": 800000,
-    "p_w": 1.0,
-    "v_w": 0.2,
+    "p_w": 0.4,
+    "v_w": 1.0,
     "head_w": 0.1,
     "num_workers": 2,
     "embeding": True,
@@ -85,7 +85,7 @@ except:
 
 head = torch.nn.Linear(tensor.shape[1], tensor.shape[0], bias=False)
 head.weight.data = tensor
-
+log_steps = 100
 
 def list_files(path):
     datapath = []
@@ -133,12 +133,11 @@ class CustomDataset(Dataset):
         # try:
         data = torch.load(self.data[index])
         new_data = {}
-        hidden_state = data['target'][:train_config["max_len"]]
+        hidden_state = data['target'][:, :train_config["max_len"], :]
         #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        inputs_embeds = data['hidden_state_layer0'][:train_config["max_len"]]
-        hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
-        loss_mask = data["loss_mask"][:train_config["max_len"]]
-
+        inputs_embeds = data['hidden_state_layer0'][:, :train_config["max_len"],:]
+        hidden_state_mid = data['hidden_state_layer8'][:, :train_config["max_len"],:]
+        loss_mask = data["loss_mask"][:, :train_config["max_len"]]
 
         length = hidden_state.shape[1]
         # length_q = data['query_ids'].shape[1]
@@ -150,7 +149,8 @@ class CustomDataset(Dataset):
         #zeropadding = torch.tensor([[0]])
         #input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
 
-        target = hidden_state
+          # 这样 target 是一个独立的 Tensor，不受 hidden_state 修改影响
+        target = hidden_state.clone()
         zeropadding = torch.zeros(1, 1, target.shape[2])
         #print(f"target shape: {target.shape}, hidden_state shape: {hidden_state.shape}, hidden_state_mid shape: {hidden_state_mid.shape}, loss_mask: {loss_mask}")
         hidden_state = torch.cat((zeropadding, hidden_state[:,:-1,:]), dim=1)
@@ -230,16 +230,16 @@ def compute_loss(target, target_p, predict, loss_mask):
     out_head = head_engine(predict)
     out_logp = nn.LogSoftmax(dim=2)(out_head)
     plogp = target_p * out_logp
-    ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
+    ploss = -torch.sum(torch.sum(loss_mask * plogp, 2)) / (loss_mask.sum() + 1e-5)
     vloss = criterion(predict, target.to(rank))
-    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
     kldloss = F.kl_div(out_logp, target_p, reduction='none')
-    kldloss = torch.sum(torch.mean(loss_mask * kldloss, 2)) / (loss_mask.sum() + 1e-5)
+    kldloss = torch.sum(torch.sum(loss_mask * kldloss, 2)) / (loss_mask.sum() + 1e-5)
     return vloss, kldloss, out_head
 
 def compute_mid_loss(target, predict, loss_mask):
     vloss = criterion(predict, target.to(rank))
-    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
     return vloss
 
 if train_config["data_noise"]:
@@ -292,7 +292,7 @@ head_engine, _, test_loader, _ = deepspeed.initialize(args=args,
 for param in head.parameters():
     param.requires_grad = False
 
-for epoch in range(3, num_epochs):
+for epoch in range(num_epochs):
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0
@@ -304,7 +304,7 @@ for epoch in range(3, num_epochs):
         model.zero_grad()
 
         inputs_embeds = Variable(data["inputs_embeds"], requires_grad=True)
-        last_hidden_state = Variable(data["hidden_states"], requires_grad=True)
+        last_hidden_state = Variable(data["hidden_states"], requires_grad=False)
         predict, all_hidden_states = model_engine(last_hidden_state.to(rank), inputs_embeds=inputs_embeds.to(rank),
                                attention_mask=data["attention_mask"].to(rank), output_hidden_states=True)
         mid_predict = all_hidden_states[-2]
@@ -337,9 +337,11 @@ for epoch in range(3, num_epochs):
             correct += cc
         if rank == 0 and ct != 0:
             logdict = {"train/lr": optimizer.optimizer.param_groups[0]["lr"], "train/vloss": vloss.item(),
-                       "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
+                       "train/ploss": ploss.item(), "train/mid_vloss": mid_vloss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
             for id, i in enumerate(top_3acc):
                 logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
+            if batch_idx % log_steps == 0:
+                print(logdict)
             # for id,i in enumerate(top_3acc):
             #     wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
 
