@@ -186,8 +186,8 @@ accelerate launch -m --mixed_precision=bf16 eagle.train.main --tmpdir [path of d
 You can also use DeepSpeed for training.
 
 ```bash
-cd eagle/train
-deepspeed main_deepspeed.py --deepspeed_config ds_config.json
+cd eagle/model
+deepspeed main_deepspeed.py --deepspeed_config /home/apc/EAGLE/eagle/train/ds_config.json --tmpdir /home/apc/Bingle/data/llava_vicuna_mmt_0/12_data/sharegpt_0_7999_mufp16 --cpdir /home/apc/EAGLE/eagle/train/vicuna-7b-ckpt --configpath /home/apc/EAGLE/eagle/train/vicuna_7B_config.json
 ```
 
 ### Inference on custom models
