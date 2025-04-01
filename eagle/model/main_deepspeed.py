@@ -69,6 +69,9 @@ import numpy as np
 
 deepspeed.init_distributed()
 rank = torch.distributed.get_rank()
+if rank == 0:
+    import wandb
+    wandb.init(project="Bingle", name="hyh209127306-bilibili", config=train_config)
 try:
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
         index_json = json.loads(f.read())
@@ -344,8 +347,8 @@ for epoch in range(3, num_epochs):
                        "train/ploss": ploss.item(), "train/loss": loss.item(), "train/acc": cc / ct}
             for id, i in enumerate(top_3acc):
                 logdict[f'train/top_{id + 1}_acc'] = topkacc[id].item() / ct
-            # for id,i in enumerate(top_3acc):
-            #     wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
+            for id,i in enumerate(top_3acc):
+                 wandb.log({f'train/top_{id+1}_acc':topkacc[id].item()/ct})
 
         del ploss, vloss
         epoch_loss += loss.item()
@@ -359,6 +362,8 @@ for epoch in range(3, num_epochs):
     if accelerator.is_local_main_process:
         print('Epoch [{}/{}], Loss: {:.4f}'.format(epoch + 1, num_epochs, epoch_loss))
         print('Train Accuracy: {:.2f}%'.format(100 * correct / (total + 1e-5)))
+        wandb.log(
+            {"train/epochacc": correct / (total + 1e-5), "train/epochloss": epoch_loss})
 
     model_engine.save_16bit_model(f"{args.cpdir}/state_{epoch}")
     if epoch % 10 == 0:
