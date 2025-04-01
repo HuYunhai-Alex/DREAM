@@ -5,7 +5,7 @@ parser.add_argument('--basepath', type=str, default='/scratch/yh5961/models/llav
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--bs', type=int, default=1)
-parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
+parser.add_argument('--gradient-accumulation-steps', type=int, default=2)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
 args = parser.parse_args()
@@ -20,7 +20,7 @@ train_config = {
     # Depending on your data and model size, the larger the model, the higher the sample efficiency. We recommend setting it between 20-40.
     "num_warmup_steps": 2000,
     "total_steps": 800000,
-    "p_w": 0.1,
+    "p_w": 0.2,
     "v_w": 1.0,
     "head_w": 0.1,
     "num_workers": 4,
@@ -31,7 +31,7 @@ train_config = {
     "mean": 0.0,
     "std": 0.2,
     "residual": "true,norm",
-    "max_len": 2048,
+    "max_len": 5120,
     # During training, truncating the training sequences means that the larger the setting, the more training data is used, and the better the effect, but it also consumes more VRAM.
     "config_path": args.configpath,
     "b1": 0.9,
@@ -140,9 +140,10 @@ class CustomDataset(Dataset):
         data = torch.load(self.data[index])
         new_data = {}
         hidden_state = data['target'][:train_config["max_len"]]
+        hidden_state_second = hidden_state.clone()
         #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        inputs_embeds = data['hidden_state_layer0'][:train_config["max_len"]]
-        hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
+        inputs_embeds = data['inputs_embeds'][:train_config["max_len"]]
+        hidden_state_mid = data['hidden_state_mid'][:train_config["max_len"]]
         loss_mask = data["loss_mask"][:train_config["max_len"]]
 
 
@@ -157,9 +158,8 @@ class CustomDataset(Dataset):
         #input_ids_target = torch.cat((input_ids_target, zeropadding), dim=1)
 
         target = hidden_state
-        zeropadding = torch.zeros(1, 1, target.shape[2])
-        #print(f"target shape: {target.shape}, hidden_state shape: {hidden_state.shape}, hidden_state_mid shape: {hidden_state_mid.shape}, loss_mask: {loss_mask}")
-        hidden_state = torch.cat((zeropadding, hidden_state[:,:-1,:]), dim=1)
+        
+        hidden_state = hidden_state[:,:-1,:]
         #loss_mask[-1] = 0
         new_data["attention_mask"] = attention_mask
         new_data["loss_mask"] = loss_mask
@@ -174,7 +174,6 @@ class CustomDataset(Dataset):
             new_data = self.transform(new_data)
 
         return new_data
-
 
 class DataCollatorWithPadding:
 
@@ -192,10 +191,10 @@ class DataCollatorWithPadding:
         return outtensors
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        max_length = max(item['hidden_state_big'].shape[1] for item in features)
+        max_length = max(item['hidden_state_mid'].shape[1] for item in features)
         # batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
         batch_inputs_embeds = torch.cat([self.paddingtensor(item['inputs_embeds'], max_length) for item in features])
-        batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length) for item in features])
+        batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length-1) for item in features])
         batch_hidden_states_mid = torch.cat([self.paddingtensor(item['hidden_state_mid'], max_length) for item in features])
         batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
         batch_loss_mask = torch.tensor(
@@ -241,6 +240,11 @@ def compute_loss(target, target_p, predict, loss_mask):
     vloss = criterion(predict, target)
     vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.sum() + 1e-5)
     return vloss, ploss, out_head
+
+def compute_mid_loss(target, predict, loss_mask):
+    vloss = criterion(predict, target)
+    vloss = torch.sum(torch.mean(loss_mask * vloss, 2)) / (loss_mask.shape[0] * loss_mask.shape[1] + 1e-5)
+    return vloss
 
 @torch.no_grad()
 def getkacc(model, data, head, max_length=5):
@@ -361,19 +365,23 @@ for epoch in range(num_epochs + 1):
     model.train()
     for batch_idx, data in enumerate(tqdm(train_loader)):
         from torch.autograd import Variable
-        inputs_embeds = Variable(data["inputs_embeds"], requires_grad=True)
-        last_hidden_state = Variable(data["hidden_states"], requires_grad=True)
+        inputs_embeds = Variable(data["inputs_embeds"].to(torch.half), requires_grad=True)
+        last_hidden_state = Variable(data["hidden_states"].to(torch.half), requires_grad=True)
 
         with accelerator.accumulate(model):
             optimizer.zero_grad()
-            predict = model(last_hidden_state, inputs_embeds=inputs_embeds, attention_mask=data["attention_mask"])
+            predict, all_hidden_states = model(last_hidden_state, inputs_embeds=inputs_embeds,
+                               attention_mask=data["attention_mask"], output_hidden_states=True)
+            mid_predict = all_hidden_states[-2]
             with torch.no_grad():
                 target_head = head(data["target"])
                 target_p = nn.Softmax(dim=2)(target_head)
                 target_p = target_p.detach()
             loss_mask = data["loss_mask"][:, :, None]
             vloss, ploss, out_head = compute_loss(data["target"], target_p, predict, loss_mask)
-            loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss
+            mid_vloss = compute_mid_loss(data["hidden_states_mid"], mid_predict, loss_mask)
+            loss = train_config["v_w"] * vloss + train_config["p_w"] * ploss + mid_vloss
+        
             # loss.backward()
             accelerator.backward(loss)
             accelerator.clip_grad_value_(model.parameters(), train_config["grad_clip"])
