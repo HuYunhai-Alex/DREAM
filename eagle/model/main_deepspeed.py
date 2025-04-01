@@ -299,7 +299,7 @@ head_engine, _, test_loader, _ = deepspeed.initialize(args=args,
 for param in head.parameters():
     param.requires_grad = False
 
-for epoch in range(3, num_epochs):
+for epoch in range(0, num_epochs):
     top_3acc = [0 for _ in range(3)]
     correct = 0
     total = 0
