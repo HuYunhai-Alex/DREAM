@@ -2,7 +2,7 @@ import argparse
 import deepspeed
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--basepath', type=str, default='/scratch/yh5961/models/llava-v1.6-vicuna-7b-hf')
+parser.add_argument('--basepath', type=str, default='/home/asperger/models/llava-v1.6-vicuna-7b-hf')
 parser.add_argument('--configpath', type=str, default="config.json")
 parser.add_argument('--tmpdir', type=str,
                     default='/home/lyh/code/nlp/ess/feature_data_dataset/sharegpt_0_67999_mu_V7B/')
@@ -36,7 +36,7 @@ train_config = {
     "mean": 0.0,
     "std": 0.2,
     "residual": "true,norm",
-    "max_len": 2048,
+    "max_len": 5120,
     "config_path": args.configpath,
     "b1": 0.9,
     "b2": 0.95,
@@ -140,8 +140,8 @@ class CustomDataset(Dataset):
         hidden_state = data['target'][:train_config["max_len"]]
         hidden_state_second = hidden_state.clone()
         #input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-        inputs_embeds = data['hidden_state_layer0'][:train_config["max_len"]]
-        hidden_state_mid = data['hidden_state_layer8'][:train_config["max_len"]]
+        inputs_embeds = data['inputs_embeds'][:train_config["max_len"]]
+        hidden_state_mid = data['hidden_state_mid'][:train_config["max_len"]]
         loss_mask = data["loss_mask"][:train_config["max_len"]]
 
 
@@ -190,10 +190,10 @@ class DataCollatorWithPadding:
         return outtensors
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        max_length = max(item['hidden_state_big'].shape[1] for item in features)
+        max_length = max(item['hidden_state_mid'].shape[1] for item in features)
         # batch_input_ids = torch.cat([self.paddingtensor2D(item['input_ids'], max_length) for item in features])
         batch_inputs_embeds = torch.cat([self.paddingtensor(item['inputs_embeds'], max_length) for item in features])
-        batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length) for item in features])
+        batch_hidden_states = torch.cat([self.paddingtensor(item['hidden_state_big'], max_length-1) for item in features])
         batch_hidden_states_mid = torch.cat([self.paddingtensor(item['hidden_state_mid'], max_length) for item in features])
         batch_target = torch.cat([self.paddingtensor(item['target'], max_length) for item in features])
         batch_loss_mask = torch.tensor(
@@ -307,8 +307,8 @@ for epoch in range(3, num_epochs):
 
         model.zero_grad()
 
-        inputs_embeds = Variable(data["inputs_embeds"], requires_grad=True)
-        last_hidden_state = Variable(data["hidden_states"], requires_grad=True)
+        inputs_embeds = Variable(data["inputs_embeds"].to(torch.float16), requires_grad=True)
+        last_hidden_state = Variable(data["hidden_states"].to(torch.float16), requires_grad=True)
         predict, all_hidden_states = model_engine(last_hidden_state.to(rank), inputs_embeds=inputs_embeds.to(rank),
                                attention_mask=data["attention_mask"].to(rank), output_hidden_states=True)
         mid_predict = all_hidden_states[-2]
