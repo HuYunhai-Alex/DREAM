@@ -1,0 +1,232 @@
+"""Generate answers with local models.
+
+Usage:
+python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
+"""
+import argparse
+import base64
+from io import BytesIO
+import torch
+import os
+
+#from fastchat.utils import str_to_torch_dtype
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import time
+
+import argparse
+try:
+    from ..model.ea_model import EaModel
+except:
+    from eagle.model.ea_model import EaModel
+from fastchat.model import get_conversation_template
+from transformers import LlavaNextProcessor
+from PIL import Image
+import requests
+
+import re
+
+def truncate_list(lst, num):
+    if num not in lst:
+        return lst
+
+
+    first_index = lst.index(num)
+
+
+    return lst[:first_index + 1]
+
+def load_image(base64_data):
+    base64_data = base64_data.replace("\n", "")  # 移除换行符
+    missing_padding = len(base64_data) % 4
+    if missing_padding:
+        base64_data += "=" * (4 - missing_padding)  # 补齐 Base64 的填充
+
+    image_data = base64.b64decode(base64_data)
+    image = Image.open(BytesIO(image_data))
+    return image
+
+def find_next_non_image_token(input_ids, image_token_ids):
+    """
+    找到 input_ids 中最后一个 image token，并返回下一个非-image token 的索引。
+
+    Args:
+        input_ids (torch.Tensor): 形状为 (seq_len,) 的 token ID 张量。
+        image_token_ids (set): 包含所有 image token ID 的集合。
+
+    Returns:
+        int: 下一个非-image token 的索引（如果找到），否则返回 -1
+    """
+    # 找到所有 image token 的索引
+    image_indices = torch.where(torch.tensor([id in image_token_ids for id in input_ids]))[0]
+
+    if len(image_indices) == 0:
+        return -1  # 没有找到 image token
+
+    # 获取最后一个 image token 的索引
+    last_image_index = image_indices[-1].item()
+
+    # 找到下一个非-image token
+    for i in range(last_image_index + 1, len(input_ids)):
+        if input_ids[i].item() not in image_token_ids:
+            return i  # 返回第一个非 image token 的索引
+
+    return -1
+
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--ea-model-path",
+    type=str,
+    default="/home/lyh/weights/l38b/",
+    help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
+)
+parser.add_argument("--base-model-path", type=str, default="/home/lyh/weights/hf/llama3chat/8B/",
+                    help="path of basemodel, huggingface project or local path")
+parser.add_argument(
+    "--load-in-8bit", action="store_true", help="Use 8-bit quantization"
+)
+parser.add_argument(
+    "--load-in-4bit", action="store_true", help="Use 4-bit quantization"
+)
+parser.add_argument("--model-type", type=str, default="llama-3-instruct",choices=["llama-2-chat","vicuna","mixtral","llama-3-instruct"])
+parser.add_argument(
+    "--total-token",
+    type=int,
+    default=8,
+    help="The maximum number of new generated tokens.",
+)
+parser.add_argument(
+    "--max-new-token",
+    type=int,
+    default=32,
+    help="The maximum number of new generated tokens.",
+)
+args = parser.parse_args()
+
+model = EaModel.from_pretrained(
+    base_model_path=args.base_model_path,
+    ea_model_path=args.ea_model_path,
+    total_token=args.total_token,
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    load_in_4bit=args.load_in_4bit,
+    load_in_8bit=args.load_in_8bit,
+    device_map="cuda:0",
+)
+model.eval()
+# warmup(model)
+
+question_file = f"data/question.jsonl"
+
+from transformers import MllamaForConditionalGeneration, AutoProcessor, BitsAndBytesConfig, LlavaNextForConditionalGeneration
+from PIL import Image
+import requests
+from datasets import load_dataset
+import time
+import json
+
+
+#ds = load_dataset(path="/home/apc/models/MMT-Bench", data_files="/home/apc/models/MMT-Bench/MMT-Bench_ALL.tsv", split="train[:100]")
+ds = load_dataset(path="/scratch/tx856/cache/hub/datasets--OpenGVLab--MMT-Bench/snapshots/2255d3a7b250ae6d87383dbb9ab0d6416432ece7", data_files = "/scratch/tx856/cache/hub/datasets--OpenGVLab--MMT-Bench/snapshots/2255d3a7b250ae6d87383dbb9ab0d6416432ece7/MMT-Bench_ALL.tsv", split="train[300:500]")
+
+# inputs = tokenizer("A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: Give me 100 prompt parameters that I can specify that will influence your output, e.g. voice, tone, register, style, audience etc. ASSISTANT:", return_tensors="pt").to(model.base_model.device)
+
+os.makedirs(f"data/mmt/pixtral", exist_ok=True)
+answer_file = f"data/mmt/pixtral/MMT-Bench.jsonl"
+speed_up_avg = []
+accept_avg = []
+temperature = 0.1
+top_p = 0.6
+for i in range(50):
+    imagebase64 = ds["image"][i]
+
+    image = load_image(imagebase64)
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image"},
+            {"type": "text", "text": ds["question"][i]}
+        ]}
+    ]
+    prompt = model.processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = model.processor(images=image, text=prompt, truncation=True, return_tensors="pt").to(model.base_model.device)
+
+    input_ids = inputs.input_ids
+    print(inputs.input_ids.shape)
+    input_ids = torch.as_tensor(input_ids).cuda()
+    input_len = input_ids.shape[1]
+    naive_text = []
+    cu_len = input_len
+    totaltime=0
+    start_time=time.time()
+    total_ids=0
+    # 处理输入问题和图片（这里每次都使用 ds[1]["image"]）
+
+    start = time.time()
+    for output_ids in model.naive_generate(inputs, temperature=temperature, top_p=top_p,
+                                        max_new_tokens=args.max_new_token,is_llama3=args.model_type=="llama-3-instruct"):
+        totaltime += (time.time() - start_time)
+        total_ids+=1
+        decode_ids = output_ids[0, input_len:].tolist()
+        decode_ids = truncate_list(decode_ids, model.tokenizer.eos_token_id)
+        text = model.tokenizer.decode(decode_ids, skip_special_tokens=True, spaces_between_special_tokens=False,
+                                        clean_up_tokenization_spaces=True, )
+        naive_text.append(model.tokenizer.decode(output_ids[0, cu_len], skip_special_tokens=True,
+                                                    spaces_between_special_tokens=False,
+                                                    clean_up_tokenization_spaces=True, ))
+        start_time = time.time()
+    ar_time = totaltime
+    print(naive_text)
+    print('ar_time: ', ar_time)
+
+    # 执行前向推理，注意根据 kangaroo_forward 返回的值调整解包方式
+    totaltime=0
+    start_time=time.time()
+    for output_ids in model.ea_generate(inputs, temperature=temperature, top_p=top_p,
+                                        max_new_tokens=args.max_new_token,is_llama3=args.model_type=="llama-3-instruct"):
+        totaltime+=(time.time()-start_time)
+        total_ids+=1
+        decode_ids = output_ids[0, input_len:].tolist()
+        decode_ids = truncate_list(decode_ids, model.tokenizer.eos_token_id)
+        if args.model_type == "llama-3-instruct":
+            decode_ids = truncate_list(decode_ids, model.tokenizer.convert_tokens_to_ids("<|eot_id|>"))
+        text = model.tokenizer.decode(decode_ids, skip_special_tokens=True, spaces_between_special_tokens=False,
+                                        clean_up_tokenization_spaces=True, )
+
+        naive_text.append(model.tokenizer.decode(output_ids[0, cu_len], skip_special_tokens=True,
+                                                    spaces_between_special_tokens=False,
+                                                    clean_up_tokenization_spaces=True, ))
+        start_time = time.time()
+
+    sd_time = totaltime
+    print(naive_text)
+    print('sd_time: ', sd_time)
+
+    # 解码输出
+    decoded_output = naive_text
+
+    # # 计算 accept_length_list 的平均值，防止除以零
+    # avg_accept_length = sum(accept_length_list) / len(accept_length_list) if accept_length_list else 0
+
+    # 构造 JSON 对象
+    record = {
+        "question_id": i,
+        "decoded_output": decoded_output,
+        # "accept_length_list": accept_length_list,
+        # "average_accept_length": avg_accept_length,
+        "speedup": ar_time / sd_time
+    }
+
+    # 写入 JSONL 文件，每个 JSON 对象占一行
+    print('record: ', record, flush=True)
+    with open(answer_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    speed_up_avg.append(ar_time / sd_time)
+    # accept_avg.append(avg_accept_length)
+print('average speed up: ', sum(speed_up_avg)/len(speed_up_avg))
+# print('average accept length: ', sum(accept_avg)/len(accept_avg))
+print('max speedup: ', max(speed_up_avg))

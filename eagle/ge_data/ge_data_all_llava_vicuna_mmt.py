@@ -28,7 +28,7 @@ from torch.utils.data import Dataset, DataLoader
 
 #bigname="/home/apc/models/vicuna-7b-v1.3/"
 
-target_model_id = "/home/apc/models/llava-v1.6-vicuna-13b-hf"
+target_model_id = "/home/asperger/models/llava-v1.6-vicuna-7b-hf"
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True,                     # 开启 4-bit 量化
     bnb_4bit_compute_dtype=torch.float16,  # 计算时使用的数值类型，可选：torch.float16, torch.bfloat16 等
@@ -38,9 +38,10 @@ quantization_config = BitsAndBytesConfig(
 
 bigmodel = LlavaNextForConditionalGeneration.from_pretrained(
     target_model_id,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     device_map="auto",
-   # quantization_config=quantization_config
+    attn_implementation="eager",
+    quantization_config=quantization_config
 )
 processor = AutoProcessor.from_pretrained(target_model_id)
 
@@ -195,7 +196,352 @@ def mid_feature_collect(hidden_states):
     selected_features = selected_features.squeeze(2)
     return selected_features
 
-ds = load_dataset("/home/apc/Bingle/analysis", data_files="/home/apc/Bingle/mmt-bench-llava-v1.6-vicuna-7b.jsonl", split="train")
+def compute_cosine_distance(f1, f2, eps=1e-8):
+    """
+    计算两个 feature 向量之间的余弦距离：
+      f1, f2: Tensor, shape = (B, s, d)
+    返回: cosine distance, shape = (B, s)
+    """
+    cosine_sim = F.cosine_similarity(f1, f2, dim=-1, eps=eps)  # (B, s)
+    cosine_dist = 1 - cosine_sim  # (B, s)
+
+    return cosine_dist
+
+def compute_l2_distance(f1, f2, eps=1e-8):
+    """
+    计算两个 feature 向量之间的 L2 距离：
+      f1, f2: Tensor, shape = (B, s, d)
+    返回: L2 distance, shape = (B, s)
+    """
+    # 计算两个向量的差值
+    diff = f1 - f2  # (B, s, d)
+    # 对差值的每个维度平方后求和，然后取平方根
+    l2_dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + eps)  # (B, s)
+    return l2_dist
+
+def compute_attention_entropy(attn_weights, eps=1e-8):
+    """
+    对每层的 attention 权重计算熵：
+      attn_weights: Tensor, shape = (B, head, qlen, kvlen)
+    这里对 kvlen 维度计算熵，再对 head 取平均，返回 shape = (B, qlen)
+    """
+    attn_weights = attn_weights.to(torch.float16).cpu()
+    # 沿着 kvlen 计算熵
+    entropy = - (attn_weights * torch.log(attn_weights + eps)).sum(dim=-1)  # (B, head, qlen)
+    # 对 head 平均
+    attn_entropy = entropy.mean(dim=1)  # (B, qlen)
+    return attn_entropy
+
+def compute_mutual_attention_entropy(attn_weights1, attn_weights2, eps=1e-8):
+    """
+    计算两个 attention weight 的 mutual entropy（互信息）。
+    
+    参数：
+      attn_weights1: Tensor, shape = (B, head, qlen, kvlen)
+      attn_weights2: Tensor, shape = (B, head, qlen, kvlen)
+      eps: 防止 log(0) 的小常数
+      
+    计算步骤：
+      1. 分别调用 compute_attention_entropy 计算两个 attention 分布的边际熵（形状为 (B, qlen)）。
+      2. 计算联合 attention 分布：逐元素相乘后沿 kvlen 维度归一化，再计算熵，最后对 head 维度取平均，得到形状为 (B, qlen)。
+      3. mutual entropy 定义为：entropy1 + entropy2 - joint_entropy
+      
+    返回：
+      Tensor，形状为 (B, qlen)
+    """
+    # 计算两个 attention 分布各自的边际熵
+    entropy1 = compute_attention_entropy(attn_weights1, eps)  # (B, qlen)
+    entropy2 = compute_attention_entropy(attn_weights2, eps)  # (B, qlen)
+    attn_weights1 = attn_weights1.to(torch.float16).cpu()
+    attn_weights2 = attn_weights2.to(torch.float16).cpu()
+    
+    # 计算联合 attention 分布：逐元素乘积，然后归一化
+    joint = attn_weights1 * attn_weights2  # (B, head, qlen, kvlen)
+    joint = joint / (joint.sum(dim=-1, keepdim=True) + eps)  # 归一化 joint 分布
+    
+    # 计算联合熵（对 kvlen 维度求和，再对 head 取平均）
+    joint_entropy = - (joint * torch.log(joint + eps)).sum(dim=-1)  # (B, head, qlen)
+    joint_entropy = joint_entropy.mean(dim=1)  # (B, qlen)
+    
+    # mutual entropy 定义为边际熵之和减去联合熵
+    mutual_entropy = entropy1 + entropy2 - joint_entropy
+    return mutual_entropy
+
+def mid_feature_collect_a(features_tuple, attn_tuple, eps=1e-8):
+    """
+    输入:
+      features_tuple: tuple，每个元素为 tensor，形状为 (B, s, d)
+        总层数 L = len(features_tuple)
+    实现步骤：
+      1. 对每层的每个 token 计算 feature entropy
+      2. 计算每层与相邻层（前一层、后一层）的余弦距离和
+      3. 预先堆叠后，基于向量化操作归一化和求和组合度量
+      4. 对于每个 token，在所有层中选择度量最小的层作为最佳层
+    返回:
+      best_layer_idx: Tensor, shape = (B, s)，每个 token 对应的最佳层索引
+      best_features: Tensor, shape = (B, s, d)，对应层的 feature
+    """
+    L = int(0.4 * (len(features_tuple)-1))  # 总层数
+    B, s, d = features_tuple[0].shape
+    print(L)
+
+    # 预先堆叠各层 feature，得到 (L, B, s, d)
+    features_stack = torch.stack(features_tuple[:L+1], dim=0).cpu()
+
+    # 1. 计算各层的 feature entropy
+    #entropy_stack = compute_feature_entropy(features_stack, eps=eps)[1:]  # (L, B, s)
+    #print(entropy_stack)
+
+    # 2. 计算余弦距离（与相邻层之间的和），提前堆叠有助于利用张量操作
+    # cosine_list = []
+    # for l in range(1, L):
+    #     cd = torch.zeros((B, s), device=features_stack.device)
+    #     cd += compute_cosine_distance(features_tuple[l], features_tuple[l-1])
+    #     cd += compute_cosine_distance(features_tuple[l], features_tuple[l+1])
+    #     cosine_list.append(cd)
+    # cosine_stack = torch.stack(cosine_list, dim=0)  # (L, B, s)
+
+    att_entropy_list = []
+    for l in range(L):
+        # 对应层的 attention 权重 shape = (B, head, qlen, kvlen)
+        att_entropy = compute_attention_entropy(attn_tuple[l].to(features_stack.device), eps=eps)  # (B, qlen)
+        att_entropy_list.append(att_entropy)
+    att_entropy_stack = torch.stack(att_entropy_list, dim=0)  # (L, B, s)
+
+    att_mutual_entropy_list = []
+    for l in range(1, L-1):
+        cd = torch.zeros((B, s), device=features_stack.device)
+        cd += compute_mutual_attention_entropy(attn_tuple[l].to(features_stack.device), attn_tuple[l-1].to(features_stack.device))
+        cd += compute_mutual_attention_entropy(attn_tuple[l].to(features_stack.device), attn_tuple[l+1].to(features_stack.device))
+        att_mutual_entropy_list.append(cd)
+    att_mutual_entropy_stack = torch.stack(att_mutual_entropy_list, dim=0)  # (L, B, s)
+
+    # 3. 对两个度量在层维度上归一化（利用向量化操作），归一化到 [0,1]
+    def normalize_metric(metric):
+        min_val, _ = metric.min(dim=0, keepdim=True)  # (1, B, s)
+        max_val, _ = metric.max(dim=0, keepdim=True)  # (1, B, s)
+        normalized = (metric - min_val) / (max_val - min_val + eps)
+        return normalized
+
+    entropy_norm = normalize_metric(att_mutual_entropy_stack)
+    #cosine_norm = normalize_metric(cosine_stack)
+    attn_entropy_norm = normalize_metric(att_entropy_stack)
+    #print("Cosine Dis:", cosine_stack)
+
+    #print("Normalized Feature Entropy:", entropy_norm)
+    #print("Normalized Cosine Distance:", cosine_norm)
+    #print("Normalized Attention Entropy:", attn_entropy_norm)
+
+
+    # 合并度量
+    # total_metric = matrix_entropy_stack + cosine_stack + att_entropy_stack # (L, B, s)
+    total_metric = att_entropy_stack[1:L-1] + att_mutual_entropy_stack# (L, B, s)
+    #total_metric = att_mutual_entropy_stack# (L, B, s)
+
+
+    # 4. 对每个 token 选择总得分最小的层
+    best_layer_idx = total_metric.argmin(dim=0) + 1  # (B, s)
+
+    # 根据最佳层索引选择对应的 feature（利用提前堆叠的 features_stack）
+    best_layer_idx_expanded = best_layer_idx.unsqueeze(0).unsqueeze(-1)  # (1, B, s, 1)
+    best_features_a = torch.gather(features_stack, dim=0, 
+                                 index=best_layer_idx_expanded.expand(1, B, s, d)).squeeze(0)  # (B, s, d)
+    print(best_layer_idx)
+
+    total_metric = att_entropy_stack[1:L-1]# (L, B, s)
+    #total_metric = att_mutual_entropy_stack# (L, B, s)
+
+
+    # 4. 对每个 token 选择总得分最小的层
+    best_layer_idx = total_metric.argmin(dim=0) + 1  # (B, s)
+
+    # 根据最佳层索引选择对应的 feature（利用提前堆叠的 features_stack）
+    best_layer_idx_expanded = best_layer_idx.unsqueeze(0).unsqueeze(-1)  # (1, B, s, 1)
+    best_features_b = torch.gather(features_stack, dim=0, 
+                                 index=best_layer_idx_expanded.expand(1, B, s, d)).squeeze(0)  # (B, s, d)
+    print(best_layer_idx)
+
+    total_metric = att_mutual_entropy_stack# (L, B, s)
+    #total_metric = att_mutual_entropy_stack# (L, B, s)
+
+
+    # 4. 对每个 token 选择总得分最小的层
+    best_layer_idx = total_metric.argmin(dim=0) + 1  # (B, s)
+
+    # 根据最佳层索引选择对应的 feature（利用提前堆叠的 features_stack）
+    best_layer_idx_expanded = best_layer_idx.unsqueeze(0).unsqueeze(-1)  # (1, B, s, 1)
+    best_features_c = torch.gather(features_stack, dim=0, 
+                                 index=best_layer_idx_expanded.expand(1, B, s, d)).squeeze(0)  # (B, s, d)
+
+    print(best_layer_idx)
+    return best_features_a.cpu(), best_features_b.cpu(), best_features_c.cpu()
+
+def mid_feature_collect_b(features_tuple, attn_tuple, eps=1e-8):
+    """
+    输入:
+      features_tuple: tuple，每个元素为 tensor，形状为 (B, s, d)
+        总层数 L = len(features_tuple)
+    实现步骤：
+      1. 对每层的每个 token 计算 feature entropy
+      2. 计算每层与相邻层（前一层、后一层）的余弦距离和
+      3. 预先堆叠后，基于向量化操作归一化和求和组合度量
+      4. 对于每个 token，在所有层中选择度量最小的层作为最佳层
+    返回:
+      best_layer_idx: Tensor, shape = (B, s)，每个 token 对应的最佳层索引
+      best_features: Tensor, shape = (B, s, d)，对应层的 feature
+    """
+    L = int(0.4 * (len(features_tuple)-1))  # 总层数
+    B, s, d = features_tuple[0].shape
+    print(L)
+
+    # 预先堆叠各层 feature，得到 (L, B, s, d)
+    features_stack = torch.stack(features_tuple[:L+1], dim=0)
+
+    # 1. 计算各层的 feature entropy
+    #entropy_stack = compute_feature_entropy(features_stack, eps=eps)[1:]  # (L, B, s)
+    #print(entropy_stack)
+
+    # 2. 计算余弦距离（与相邻层之间的和），提前堆叠有助于利用张量操作
+    cosine_list = []
+    for l in range(1, L):
+        cd = torch.zeros((B, s), device=features_stack.device)
+        cd += compute_cosine_distance(features_tuple[l], features_tuple[l-1])
+        cd += compute_cosine_distance(features_tuple[l], features_tuple[l+1])
+        cosine_list.append(cd)
+    cosine_stack = torch.stack(cosine_list, dim=0)  # (L, B, s)
+
+    att_entropy_list = []
+    for l in range(L):
+        # 对应层的 attention 权重 shape = (B, head, qlen, kvlen)
+        att_entropy = compute_attention_entropy(attn_tuple[l], eps=eps)  # (B, qlen)
+        att_entropy_list.append(att_entropy)
+    att_entropy_stack = torch.stack(att_entropy_list, dim=0)  # (L, B, s)
+
+    att_mutual_entropy_list = []
+    for l in range(1, L-1):
+        cd = torch.zeros((B, s), device=features_stack.device)
+        cd += compute_mutual_attention_entropy(attn_tuple[l], attn_tuple[l-1])
+        cd += compute_mutual_attention_entropy(attn_tuple[l], attn_tuple[l+1])
+        att_mutual_entropy_list.append(cd)
+    att_mutual_entropy_stack = torch.stack(att_mutual_entropy_list, dim=0)  # (L, B, s)
+
+    # 3. 对两个度量在层维度上归一化（利用向量化操作），归一化到 [0,1]
+    def normalize_metric(metric):
+        min_val, _ = metric.min(dim=0, keepdim=True)  # (1, B, s)
+        max_val, _ = metric.max(dim=0, keepdim=True)  # (1, B, s)
+        normalized = (metric - min_val) / (max_val - min_val + eps)
+        return normalized
+
+    entropy_norm = normalize_metric(att_mutual_entropy_stack)
+    cosine_norm = normalize_metric(cosine_stack)
+    attn_entropy_norm = normalize_metric(att_entropy_stack)
+    #print("Normalized Feature Entropy:", entropy_norm)
+    #print("Normalized Cosine Distance:", cosine_norm)
+    #print("Normalized Attention Entropy:", attn_entropy_norm)
+
+
+    # 合并度量
+    # total_metric = matrix_entropy_stack + cosine_stack + att_entropy_stack # (L, B, s)
+    total_metric = att_entropy_stack[1:L-1]# (L, B, s)
+    #total_metric = att_mutual_entropy_stack# (L, B, s)
+
+
+    # 4. 对每个 token 选择总得分最小的层
+    best_layer_idx = total_metric.argmin(dim=0) + 1  # (B, s)
+
+    # 根据最佳层索引选择对应的 feature（利用提前堆叠的 features_stack）
+    best_layer_idx_expanded = best_layer_idx.unsqueeze(0).unsqueeze(-1)  # (1, B, s, 1)
+    best_features = torch.gather(features_stack, dim=0, 
+                                 index=best_layer_idx_expanded.expand(1, B, s, d)).squeeze(0)  # (B, s, d)
+    print(best_layer_idx)
+
+    return best_features
+
+def mid_feature_collect_c(features_tuple, attn_tuple, eps=1e-8):
+    """
+    输入:
+      features_tuple: tuple，每个元素为 tensor，形状为 (B, s, d)
+        总层数 L = len(features_tuple)
+    实现步骤：
+      1. 对每层的每个 token 计算 feature entropy
+      2. 计算每层与相邻层（前一层、后一层）的余弦距离和
+      3. 预先堆叠后，基于向量化操作归一化和求和组合度量
+      4. 对于每个 token，在所有层中选择度量最小的层作为最佳层
+    返回:
+      best_layer_idx: Tensor, shape = (B, s)，每个 token 对应的最佳层索引
+      best_features: Tensor, shape = (B, s, d)，对应层的 feature
+    """
+    L = int(0.4 * (len(features_tuple)-1))  # 总层数
+    B, s, d = features_tuple[0].shape
+    print(L)
+
+    # 预先堆叠各层 feature，得到 (L, B, s, d)
+    features_stack = torch.stack(features_tuple[:L+1], dim=0)
+
+    # 1. 计算各层的 feature entropy
+    #entropy_stack = compute_feature_entropy(features_stack, eps=eps)[1:]  # (L, B, s)
+    #print(entropy_stack)
+
+    # 2. 计算余弦距离（与相邻层之间的和），提前堆叠有助于利用张量操作
+    cosine_list = []
+    for l in range(1, L):
+        cd = torch.zeros((B, s), device=features_stack.device)
+        cd += compute_cosine_distance(features_tuple[l], features_tuple[l-1])
+        cd += compute_cosine_distance(features_tuple[l], features_tuple[l+1])
+        cosine_list.append(cd)
+    cosine_stack = torch.stack(cosine_list, dim=0)  # (L, B, s)
+
+    att_entropy_list = []
+    for l in range(L):
+        # 对应层的 attention 权重 shape = (B, head, qlen, kvlen)
+        att_entropy = compute_attention_entropy(attn_tuple[l], eps=eps)  # (B, qlen)
+        att_entropy_list.append(att_entropy)
+    att_entropy_stack = torch.stack(att_entropy_list, dim=0)  # (L, B, s)
+
+    att_mutual_entropy_list = []
+    for l in range(1, L-1):
+        cd = torch.zeros((B, s), device=features_stack.device)
+        cd += compute_mutual_attention_entropy(attn_tuple[l], attn_tuple[l-1])
+        cd += compute_mutual_attention_entropy(attn_tuple[l], attn_tuple[l+1])
+        att_mutual_entropy_list.append(cd)
+    att_mutual_entropy_stack = torch.stack(att_mutual_entropy_list, dim=0)  # (L, B, s)
+
+    # 3. 对两个度量在层维度上归一化（利用向量化操作），归一化到 [0,1]
+    def normalize_metric(metric):
+        min_val, _ = metric.min(dim=0, keepdim=True)  # (1, B, s)
+        max_val, _ = metric.max(dim=0, keepdim=True)  # (1, B, s)
+        normalized = (metric - min_val) / (max_val - min_val + eps)
+        return normalized
+
+    entropy_norm = normalize_metric(att_mutual_entropy_stack)
+    cosine_norm = normalize_metric(cosine_stack)
+    attn_entropy_norm = normalize_metric(att_entropy_stack)
+    print("Cosine Dis:", cosine_stack)
+    print("Attention Entropy:", att_entropy_stack)
+    print("matrix Entropy:", att_mutual_entropy_stack)
+
+    #print("Normalized Feature Entropy:", entropy_norm)
+    #print("Normalized Cosine Distance:", cosine_norm)
+    #print("Normalized Attention Entropy:", attn_entropy_norm)
+
+
+    # 合并度量
+    # total_metric = matrix_entropy_stack + cosine_stack + att_entropy_stack # (L, B, s)
+    total_metric = att_mutual_entropy_stack# (L, B, s)
+    #total_metric = att_mutual_entropy_stack# (L, B, s)
+
+
+    # 4. 对每个 token 选择总得分最小的层
+    best_layer_idx = total_metric.argmin(dim=0) + 1  # (B, s)
+
+    # 根据最佳层索引选择对应的 feature（利用提前堆叠的 features_stack）
+    best_layer_idx_expanded = best_layer_idx.unsqueeze(0).unsqueeze(-1)  # (1, B, s, 1)
+    best_features = torch.gather(features_stack, dim=0, 
+                                 index=best_layer_idx_expanded.expand(1, B, s, d)).squeeze(0)  # (B, s, d)
+    print(best_layer_idx)
+    return best_features
+
+ds = load_dataset("/home/asperger/EfficientMultimodalSpeculativeDecoding/eagle/ge_data", data_files="/home/asperger/EfficientMultimodalSpeculativeDecoding/eagle/ge_data/mmt-bench-llava-v1.6-vicuna-7b.jsonl", split="train")
 batch_size = 1
 ds = ds.shuffle(seed=42)
 if len(ds) < args.end:
@@ -206,7 +552,7 @@ data_loader = DataLoader(
     dataset, 
     batch_size=1,
     shuffle=True, 
-    num_workers=4,        # 可根据 CPU 核数进行调整
+    num_workers=1,        # 可根据 CPU 核数进行调整
     collate_fn=collate_fn,
     pin_memory=True
 )
@@ -232,7 +578,7 @@ def ge(data):
     loss_mask = torch.zeros_like(inputs.input_ids)
 
     for i in range(inputs.input_ids.size(0)):
-        tokens = inputs.input_ids[i]
+        tokens = inputs.input_ids[i].cpu()
         start_idx = None
         j = 0
         while j < tokens.size(0):
@@ -260,7 +606,8 @@ def ge(data):
     td[f"hidden_state_layer8"] = outs_big.hidden_states[8].cpu()
     td[f"hidden_state_layer16"] = outs_big.hidden_states[16].cpu()
     td[f"hidden_state_layer24"] = outs_big.hidden_states[24].cpu()
-    td[f"hidden_state_mid"] = mid_feature_collect(outs_big.hidden_states).cpu()
+    #td[f"hidden_state_mid_a"], td[f"hidden_state_mid_b"], td[f"hidden_state_mid_c"] = mid_feature_collect_a(outs_big.hidden_states, outs_big.attentions)
+
     td[f"target"] = outs_big.hidden_states[-1].cpu()
 
     return td
