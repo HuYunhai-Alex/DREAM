@@ -2,6 +2,7 @@ import copy
 import json
 import time
 
+from safetensors import safe_open
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -13,8 +14,9 @@ from transformers import PreTrainedModel, PretrainedConfig,AutoConfig
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
 from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
-from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration, AutoProcessor
 from .modeling_llava_next import LlavaNextForConditionalGeneration
+#from .modeling_llava import LlavaForConditionalGeneration
 
 from .utils import *
 from .kv_cache import initialize_past_key_values
@@ -49,7 +51,8 @@ class EaModel(nn.Module):
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path,use_fast=False)
-        self.processor = LlavaNextProcessor.from_pretrained(self.base_model_name_or_path)
+        #self.processor = LlavaNextProcessor.from_pretrained(self.base_model_name_or_path)
+        self.processor = AutoProcessor.from_pretrained(self.base_model_name_or_path)
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path,"r") as f:
             con=json.loads(f.read())
@@ -71,6 +74,29 @@ class EaModel(nn.Module):
 
         else:
             self.ea_layer.diff_device = False
+
+        print(base_model_name_or_path)
+        try:
+            with open(os.path.join(base_model_name_or_path, "model.safetensors.index.json"), "r") as f:
+                index_json = json.loads(f.read())
+                head_path = index_json["weight_map"]["language_model.lm_head.weight"]
+                print(head_path)
+            with safe_open(os.path.join(base_model_name_or_path, head_path),
+                           framework="pt",
+                           device="cpu") as f:
+                tensor_slice = f.get_slice("language_model.lm_head.weight")
+                vocab_size, hidden_dim = tensor_slice.get_shape()
+                tensor = tensor_slice[:, :hidden_dim].to(torch.bfloat16)
+        except Exception as e:
+            with open(os.path.join(base_model_name_or_path, "pytorch_model.bin.index.json"), "r") as f:
+                index_json = json.loads(f.read())
+                head_path = index_json["weight_map"]["lm_head.weight"]
+                weights = torch.load(os.path.join(base_model_name_or_path, head_path), weights_only=False)
+                tensor = weights["lm_head.weight"].to(torch.bfloat16)
+        head = torch.nn.Linear(tensor.shape[1], tensor.shape[0], bias=False)
+        head.weight.data = tensor
+        self.ea_layer.head_weight = head
+
         self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
@@ -91,8 +117,8 @@ class EaModel(nn.Module):
             base_model_path=None,
             ea_model_path=None,
             total_token=6,
-            depth=8,
-            top_k=4,
+            depth=4,
+            top_k=8,
             threshold=1.0,
             **kwargs,
     ):
@@ -114,6 +140,10 @@ class EaModel(nn.Module):
             base_model = LlavaNextForConditionalGeneration.from_pretrained(
                 base_model_path, **kwargs
             )
+        #elif Type=='LlavaForConditionalGeneration':
+        #    base_model = LlavaForConditionalGeneration.from_pretrained(
+        #        base_model_path, **kwargs
+        #    )
 
         configpath=os.path.join(ea_model_path,"config.json")
         if not os.path.exists(configpath):
@@ -213,9 +243,9 @@ class EaModel(nn.Module):
 
     ):
         input_ids = inputs.input_ids.to(self.base_model.device)
-        pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
+        pixel_values = inputs.pixel_values.to(self.base_model.device).to(torch.bfloat16) if hasattr(inputs, "pixel_values") else None
         image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
-        
+
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -407,9 +437,9 @@ class EaModel(nn.Module):
 
     ):
         input_ids = inputs.input_ids.to(self.base_model.device)
-        pixel_values = inputs.pixel_values.to(self.base_model.device) if hasattr(inputs, "pixel_values") else None
+        pixel_values = inputs.pixel_values.to(self.base_model.device).to(torch.bfloat16) if hasattr(inputs, "pixel_values") else None
         image_sizes = inputs.image_sizes.to(self.base_model.device) if hasattr(inputs, "image_sizes") else None
-        
+
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
         max_length=max_length-self.ea_layer.total_tokens-10
@@ -456,6 +486,7 @@ class EaModel(nn.Module):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens=draft_tokens.to(input_ids.device)
+            #print('draft_tokens ', draft_tokens.shape)
             #with Timer("tree_decoding"):
 
             logits, hidden_state_new, outputs = tree_decoding(
@@ -470,6 +501,14 @@ class EaModel(nn.Module):
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
             candidates=draft_tokens[0,retrieve_indices]
+            if True:
+                for i, candidate in enumerate(candidates):
+                    # Filter out padding tokens (-1)
+                    valid_tokens = [t.item() for t in candidate if t.item() != -1]
+                    # Convert tokens to text if you have access to tokenizer
+                    # candidate_text = tokenizer.decode(valid_tokens)
+                    text = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                    #print(f"Candidate {i}: [{text}]")
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
@@ -552,7 +591,7 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        
+
         input_embeds = self.embed_model(**inputs)
         outputs = self.base_model(inputs_embeds=input_embeds, past_key_values=past_key_values, use_cache=True)
         new_token = 0
@@ -585,6 +624,3 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
-
-
-
