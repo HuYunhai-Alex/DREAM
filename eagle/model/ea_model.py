@@ -116,9 +116,9 @@ class EaModel(nn.Module):
             Type="LLaMA",
             base_model_path=None,
             ea_model_path=None,
-            total_token=6,
-            depth=4,
-            top_k=8,
+            total_token=32,
+            depth=6,
+            top_k=4,
             threshold=1.0,
             **kwargs,
     ):
@@ -282,9 +282,13 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+
+        start = time.time()
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor, self.embed_model, pixel_values, image_sizes
         )
+        t0 = time.time() - start
+
         new_token = 0
 
         for idx in range(max_length):
@@ -293,6 +297,8 @@ class EaModel(nn.Module):
 
             draft_tokens=draft_tokens.to(input_ids.device)
             #with Timer("tree_decoding"):
+
+            start = time.time()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -301,6 +307,7 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            t1 += time.time() - start
             #retrieve_indices=tree_buffers["retrieve_indices"]
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
@@ -310,6 +317,8 @@ class EaModel(nn.Module):
             )
             # print(accept_length)
             #with Timer("update_inference_inputs"):
+
+            start = time.time()
             input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -324,20 +333,27 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p,
             )
-
+            t2 += time.time() - start
+            print(f"init time {t0}, verify time {t1}, draft time {t2}")
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
+                    print(f"init time {t0}, verify time {t1}, draft time {t2}")
                     break
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                print(f"init time {t0}, verify time {t1}, draft time {t2}")
                 break
             if new_token > max_new_tokens:
+                print(f"init time {t0}, verify time {t1}, draft time {t2}")
                 break
             if input_ids.shape[1] > max_length:
+                print(f"init time {t0}, verify time {t1}, draft time {t2}")
                 break
         if not log:
+            print(f"init time {t0}, verify time {t1}, draft time {t2}")
             return input_ids
         else:
+            print(f"init time {t0}, verify time {t1}, draft time {t2}")
             return input_ids, new_token, idx
 
 
@@ -476,19 +492,23 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+
+        start = time.time()
         draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor, self.embed_model, pixel_values, image_sizes
         )
+        t0 = time.time() - start
+        t1 = t2 = 0
         new_token = 0
 
-        for idx in range(max_length):
+        for idx in range(1, max_length+1):
             #with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens=draft_tokens.to(input_ids.device)
             #print('draft_tokens ', draft_tokens.shape)
             #with Timer("tree_decoding"):
-
+            start = time.time()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -497,6 +517,7 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            t1 += time.time() - start
             #retrieve_indices=tree_buffers["retrieve_indices"]
             #logits = logits[0, retrieve_indices]
             draft_tokens=torch.cat((draft_tokens,padding),dim=1)
@@ -514,6 +535,7 @@ class EaModel(nn.Module):
             )
             # print(accept_length)
             #with Timer("update_inference_inputs"):
+            start = time.time()
             input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -528,18 +550,23 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p,
             )
+            t2+=time.time()-start
 
             yield input_ids
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
+                    print(f"init time {t0}, verify time {t1/idx}, draft time {t2/idx}")
                     break
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                print(f"init time {t0}, verify time {t1/idx}, draft time {t2/idx}")
                 break
             if new_token > max_new_tokens:
+                print(f"init time {t0}, verify time {t1/idx}, draft time {t2/idx}")
                 break
             if input_ids.shape[1] > max_length:
+                print(f"init time {t0}, verify time {t1/idx}, draft time {t2/idx}")
                 break
 
 

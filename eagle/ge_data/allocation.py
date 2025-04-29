@@ -1,7 +1,7 @@
 import argparse
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--outdir', type=str, default='/home/apc/EAGLE/eagle/ge_data/llava_vicuna_13B_mmt')
+parser.add_argument('--outdir', type=str, default='llava_vicuna_7B_mmt')
 args = parser.parse_args()
 
 import os
@@ -47,7 +47,7 @@ for i in range(num_p):
     end = data_a[i][1]
     gpu_index = gpus[i]
     gpu_index_str = ' '.join(map(str, gpu_index))
-    command = "python eagle/ge_data/ge_data_all_llava_vicuna_mmt.py --start={} --end={} --index={} --gpu_index {} --outdir {}".format(start, end, index, gpu_index_str, outdir)
+    command = "python /home/asperger/EfficientMultimodalSpeculativeDecoding/eagle/ge_data/ge_data_all_llava_vicuna_mmt.py --start={} --end={} --index={} --gpu_index {} --outdir {}".format(start, end, index, gpu_index_str, outdir)
     commands.append(command)
 
 with ThreadPoolExecutor(max_workers=len(commands)) as executor:
