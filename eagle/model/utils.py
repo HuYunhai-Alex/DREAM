@@ -229,10 +229,75 @@ def initialize_tree0(input_ids, model, past_key_values, logits_processor):
     #     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, hidden_states, token
     return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token
 
+from torch.nn.utils.rnn import pad_sequence
+
+def prune_image_tokens(
+    input_ids: torch.LongTensor,      # [B, L]
+    embeds: torch.Tensor,             # [B, L, D]
+    scores: torch.Tensor,       # [B, H, Q, K]
+    image_token_id: int,
+    keep_ratio: float = 0.3,
+    start: int = None,
+    end: int = None,
+    pad_token_id: int = 0
+):
+    """
+    在 image token 上做 pruning，并同步处理 embeds：
+      - input_ids:    [B, L]
+      - embeds:       [B, L, D]
+      - attn_weights: [B, H, Q, K] (Q==K==L)
+      - image_token_id: 用于区分 image token 的特殊 id
+      - keep_ratio:   在 image token 中保留多少比例
+      - start,end:    可选，仅在 [start,end) 区间内做 pruning
+    返回：
+      new_input_ids: [B, L_new]
+      new_embeds:    [B, L_new, D]
+    """
+    B, L = input_ids.shape
+    D = embeds.size(-1)
+    device = input_ids.device
+
+    # 2. 找出每个 batch 中 image token 的位置 mask
+    new_ids, new_embs = [], []
+    for b in range(B):
+        # 初始保留所有非 image token
+        keep_mask = (input_ids[b] != image_token_id)
+
+        # 如果指定区间，先全部丢弃区间内的 image token，再选 top-k 放回
+        if start is not None and end is not None:
+            in_range = torch.zeros(L, dtype=torch.bool, device=device)
+            in_range[start:end] = True
+            drop_mask = (input_ids[b] == image_token_id) & in_range
+            keep_mask[drop_mask] = False
+
+            img_indices = drop_mask.nonzero(as_tuple=False).squeeze(1)
+            if img_indices.numel() > 0:
+                img_scores = scores[b, img_indices]
+                k = max(1, int(img_indices.numel() * keep_ratio))
+                topk_rel = torch.topk(img_scores, k, largest=True).indices
+                topk_idx = img_indices[topk_rel]
+                keep_mask[topk_idx] = True
+
+        # 收集
+        new_ids.append (input_ids[b][keep_mask])
+        new_embs.append(embeds[b][keep_mask])
+
+    # 2) 根据 B 决定 pad 还是 unsqueeze
+    if B == 1:
+        # 直接取第一个样本，添加 batch 维度
+        new_input_ids = new_ids[0].unsqueeze(0)   # [1, L']
+        new_embeds    = new_embs[0].unsqueeze(0)  # [1, L', D]
+    else:
+        # 多样本时 pad 到同一长度
+        new_input_ids = pad_sequence(new_ids,  batch_first=True, padding_value=pad_token_id)  # [B, L_max]
+        new_embeds    = pad_sequence(new_embs, batch_first=True, padding_value=0.0)           # [B, L_max, D]
+
+    return new_input_ids, new_embeds
+
 def initialize_tree(input_ids, model, past_key_values, logits_processor, embed_model, pixel_values, image_sizes):
     input_embeds = embed_model(input_ids, pixel_values=pixel_values, image_sizes=image_sizes)
-    outputs, orig, hidden_states = model(
-        inputs_embeds=input_embeds, past_key_values=past_key_values, output_orig=True
+    outputs, orig, hidden_states, scores = model(
+        inputs_embeds=input_embeds, past_key_values=past_key_values, output_orig=True, output_attan_score=True,
     )
 
     if logits_processor is not None:
@@ -243,13 +308,18 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, embed_m
     else:
         token = torch.argmax(orig[:, -1])
         token = token[None, None]
-    input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-    new_embeds = embed_model(token.to(embed_model.device))
-    input_embeds = torch.cat((input_embeds, new_embeds), dim=1).to(input_embeds.device)
-    # Clone the output hidden states
+    
+    draft_input_ids, draft_embeds = prune_image_tokens(input_ids=input_ids, embeds=input_embeds, scores=scores, image_token_id=32000)
+    print(draft_input_ids)
 
-    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor, input_embeds)
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
+    draft_input_ids = torch.cat((draft_input_ids, token.to(input_ids.device)), dim=1)
+    
+    new_embeds = embed_model(token.to(embed_model.device))
+    input_embeds = torch.cat((draft_embeds, new_embeds), dim=1).to(input_embeds.device)
+    # Clone the output hidden states
+    
+    draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, draft_input_ids, model.base_model.lm_head,logits_processor, input_embeds)
+    return draft_input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
 
 
 def reset_tree_mode(
@@ -409,6 +479,7 @@ def evaluate_posterior(
 @torch.no_grad()
 def update_inference_inputs(
         input_ids,
+        draft_input_ids,
         candidates,
         best_candidate,
         accept_length,
@@ -428,6 +499,9 @@ def update_inference_inputs(
     # Append the tokens from the best candidate to the input sequence
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
+    )
+    draft_input_ids = torch.cat(
+        [draft_input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
     # Update the past key values based on the selected tokens
     # Source tensor that contains relevant past information based on the selected candidate
@@ -455,13 +529,13 @@ def update_inference_inputs(
         token = token[None, None]
     # hidden_state = torch.cat((hidden_state, accept_hidden_state_new), dim=1)
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(accept_hidden_state_new,
-                                              input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
+                                              input_ids=torch.cat((draft_input_ids, token.to(input_ids.device)), dim=1),
                                               head=model.base_model.lm_head,logits_processor=logits_processor)
 
 
     new_token += accept_length + 1
 
-    return input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
+    return input_ids, draft_input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, None, token
 
 
 if __name__ == "__main__":

@@ -209,6 +209,7 @@ class EaModel(nn.Module):
             past_key_values=None,
             output_orig=False,
             position_ids=None,
+            output_attan_score=False,
     ):
 
         with torch.inference_mode():
@@ -219,14 +220,19 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_attan_score=output_attan_score,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0]
 
         if output_orig:
+            if output_attan_score:
+                return outputs, orig, hidden_states, outputs[-1]
             return outputs, orig, hidden_states
         else:
+            if output_attan_score:
+                return outputs, hidden_states, outputs[-1]
             return outputs, hidden_states
 
     @torch.no_grad()
@@ -494,7 +500,7 @@ class EaModel(nn.Module):
         reset_tree_mode(self)
 
         start = time.time()
-        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        draft_input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor, self.embed_model, pixel_values, image_sizes
         )
         t0 = time.time() - start
@@ -536,8 +542,9 @@ class EaModel(nn.Module):
             # print(accept_length)
             #with Timer("update_inference_inputs"):
             start = time.time()
-            input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+            input_ids, draft_input_ids, draft_tokens, retrieve_indices,tree_mask,tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
+                draft_input_ids,
                 candidates,
                 best_candidate,
                 accept_length,

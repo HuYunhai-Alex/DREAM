@@ -495,6 +495,39 @@ class LlamaCrossAttention(nn.Module):
         self.q_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LlamaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+    def make_causal_mask_for_cross_attention(self, q, k):
+        batch, heads, q_len, _ = q.shape
+        _, _, k_len, _ = k.shape
+        dtype, device = torch.float32, q.device
+        neg_inf = torch.finfo(dtype).min
+
+        # 基础下三角矩阵 q_len×q_len，含对角线
+        tri = torch.tril(torch.ones((q_len, q_len), device=device))
+
+        if k_len >= q_len:
+            past_len = k_len - q_len
+            left = torch.ones((q_len, past_len), device=device)
+            full = torch.cat([left, tri], dim=1)  # (q_len, k_len)
+        else:
+            full = tri[:, -k_len:] 
+
+        mask2d = torch.where(
+            full.bool(),
+            torch.zeros_like(full, dtype=dtype, device=device),
+            torch.full_like(full, neg_inf, dtype=dtype, device=device)
+        )
+
+        mask = mask2d.unsqueeze(0).unsqueeze(0).expand(batch, heads, q_len, k_len)
+
+        if hasattr(self, "tree_mask") and self.tree_mask is not None:
+            tree_mask = self.tree_mask
+            _, _, tree_shape0, tree_shape1 = tree_mask.shape
+            mask[:, :, -tree_shape0:, -tree_shape1:][
+                tree_mask == 0
+                ] = torch.finfo(torch.float32).min
+
+        return mask
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -543,7 +576,7 @@ class LlamaCrossAttention(nn.Module):
 
         if attention_mask is not None:  # no matter the length, we just slice it
             #print(f"attention_mask: {attention_mask[0,0,:5, :5]}")
-            causal_mask = attention_mask[:, :, :,  1: ]
+            causal_mask = self.make_causal_mask_for_cross_attention(query_states, key_states)
             attn_weights = attn_weights + causal_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)

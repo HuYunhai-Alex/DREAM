@@ -97,7 +97,7 @@ def warmup(model):
 
     inputs = model.processor(text=prompt, return_tensors="pt").to("cuda:0")
 
-    for output_ids in model.ea_generate(inputs):
+    for output_ids in model.naive_generate(inputs):
         ol=output_ids.shape[1]
 
 def bot(history, temperature, top_p, use_EaInfer, highlight_EaInfer,session_state,):

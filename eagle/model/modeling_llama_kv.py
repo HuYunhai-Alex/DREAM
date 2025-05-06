@@ -676,6 +676,19 @@ class LlamaDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    def compute_attention_scores(self, self_attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        生成 token 分数：
+          self_attn_weights: [B, H, Q, K] (Q==K)
+        返回：
+          scores: [B, K]，score[b, j] = mean_{h,i} attn[b,h,i,j]
+        """
+        # 对 heads 维度求均值 -> [B, Q, K]
+        scores = self_attn_weights.mean(dim=1)
+        # 对 query 维度再求均值 -> [B, K]
+        scores = scores.mean(dim=1)
+        return scores
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -683,6 +696,7 @@ class LlamaDecoderLayer(nn.Module):
             position_ids: Optional[torch.LongTensor] = None,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: Optional[bool] = False,
+            output_attan_score: Optional[bool] = False,
             use_cache: Optional[bool] = False,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -719,7 +733,7 @@ class LlamaDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
-            output_attentions=output_attentions,
+            output_attentions=output_attentions or output_attan_score,
             use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
@@ -738,6 +752,8 @@ class LlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
+        if output_attan_score:
+            outputs += (self.compute_attention_scores(self_attn_weights),)
         return outputs
 
 
@@ -932,6 +948,7 @@ class LlamaModel(LlamaPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            output_attan_score: Optional[bool] = False,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
@@ -1011,6 +1028,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        attan_scores = None 
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
@@ -1047,6 +1065,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    output_attan_score=output_attan_score,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1056,6 +1075,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+            
+        if output_attan_score:
+            attan_scores = layer_outputs[-1]
 
         hidden_states = self.norm(hidden_states)
 
@@ -1067,7 +1089,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, attan_scores]
                 if v is not None
             )
         return BaseModelOutputWithPast(
@@ -1075,6 +1097,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            attn_scores=attan_scores,
         )
 
 
@@ -1124,6 +1147,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
+            output_attan_score: Optional[bool] = False,
             return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -1176,6 +1200,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_attan_score=output_attan_score,
             return_dict=return_dict,
         )
 
@@ -1216,6 +1241,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            attn_scores=outputs.attn_scores
         )
 
     def prepare_inputs_for_generation(
