@@ -257,6 +257,9 @@ def prune_image_tokens(
     D = embeds.size(-1)
     device = input_ids.device
 
+    start = 0 if start is None else start
+    end = L if end is None else end
+
     # 2. 找出每个 batch 中 image token 的位置 mask
     new_ids, new_embs = [], []
     for b in range(B):
