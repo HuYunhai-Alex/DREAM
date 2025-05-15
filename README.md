@@ -74,30 +74,16 @@ cd dream/model
 deepspeed main_deepspeed.py --deepspeed_config /home/apc/DREAM/dream/train/ds_config.json --tmpdir /home/apc/Bingle/data/llava_vicuna_mmt_0/12_data/sharegpt_0_7999_mufp16 --cpdir /home/apc/DREAM/dream/train/vicuna-7b-ckpt --configpath /home/apc/DREAM/dream/train/vicuna_7B_config.json
 ```
 
-### Inference on custom models
-
-If the original LLM structure differs from LLaMA and Mixtral, you can utilize DREAM as follows:
-
-Copy the modeling_basemodelname.py from the Transformers library and proceed to make modifications to leverage the pre-allocated kv_cache for enhanced speed in the base model. You can refer to model/modeling_llama_kv.py for guidance, where places that require modifications are annotated with # [MODIFIED]. These modifications are minimal.
-
-
 ## Evaluation
 You can test the speed of DREAM on MT-bench using the following command.
 ```bash
-python -m dream.evaluation.gen_ea_answer_vicuna(or gen_ea_answer_vicuna_llama2chat)\
+python -m dream.evaluation.eval_llava\
 		 --ea-model-path [path of DREAM weight]\ 
 		 --base-model-path [path of the original model]\
 ```
-If you need specific acceleration ratios, you will also need to run the following command to get the speed of vanilla auto-regression.
-```bash
-python -m dream.evaluation.gen_baseline_answer_vicuna\
-		(or gen_ea_answer_vicuna_llama2chat)\
-		 --ea-model-path [path of DREAM weight]\ 
-		 --base-model-path [path of the original model]\
-```
-The above two commands will each generate a .jsonl file that records the generation results and wall time. Then, you can use evaluation/speed.py to calculate the ratio of speeds.
+The above two commands will each generate a .jsonl file that records the generation results and wall time.
 
 
 ## Acknowledgements
 
-This project has been influenced by many excellent projects in the LLM community, such as [Medusa](https://github.com/FasterDecoding/Medusa), [EAGLE](https://github.com/SafeAILab/EAGLE), [FastChat](https://github.com/lm-sys/FastChat), and others. The logo is designed by GPT-4. We also appreciate many valuable discussions with Tianle Cai, Hao Zhang, Ziteng Sun, and others.
+This project has been influenced by many excellent projects in the LLM community, such as [Medusa](https://github.com/FasterDecoding/Medusa), [EAGLE](https://github.com/SafeAILab/EAGLE), [FastChat](https://github.com/lm-sys/FastChat), and others. The logo is designed by GPT-4.
