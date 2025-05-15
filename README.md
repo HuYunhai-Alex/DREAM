@@ -32,7 +32,7 @@ We have provided a suggested web interface, which you can use by running the fol
 ```bash
 python -m dream.application.webui --ea-model-path /home/apc/models/DREAM-Vicuna-7B-v1.3 --base-model-path /home/apc/models/vicuna-7b-v1.3 --model-type vicuna --total-token 8
 ```
-The *total-token* is the number of draft tokens. For smaller models and advanced GPUs, this value can be set larger. Adjusting according to the specific device and model can achieve better results. If set to -1, DREAM-2 will automatically configure this parameter.
+The *total-token* is the number of draft tokens. For smaller models and advanced GPUs, this value can be set larger. Adjusting according to the specific device and model can achieve better results. If set to -1, DREAM will automatically configure this parameter.
 
 ### With Code
 You can use our provided "eagenerate" for speedup generation just like using 'generate' from Hugging Face. Here is an example.
