@@ -61,4 +61,4 @@ The above two commands will each generate a .jsonl file that records the generat
 
 ## Acknowledgements
 
-This project has been influenced by many excellent projects in the LLM community, such as [Medusa](https://github.com/FasterDecoding/Medusa), [EAGLE](https://github.com/SafeAILab/EAGLE), [FastChat](https://github.com/lm-sys/FastChat), and others. We first release LLaVA version, others will merge together soon.
+We would like to thank Cerebras for their generous support. This project has been inspired and influenced by many excellent projects in the LLM community, such as [Medusa](https://github.com/FasterDecoding/Medusa), [EAGLE](https://github.com/SafeAILab/EAGLE), [FastChat](https://github.com/lm-sys/FastChat), and others. We first release LLaVA version, others will merge together soon.
