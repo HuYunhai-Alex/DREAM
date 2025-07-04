@@ -46,7 +46,7 @@ python -m dream.ge_data.allocation --outdir [path of data]
 
 ```bash
 cd dream/model
-deepspeed main_deepspeed.py --deepspeed_config /home/apc/DREAM/dream/train/ds_config.json --tmpdir /home/apc/Bingle/data/llava_vicuna_mmt_0/12_data/sharegpt_0_7999_mufp16 --cpdir /home/apc/DREAM/dream/train/vicuna-7b-ckpt --configpath /home/apc/DREAM/dream/train/vicuna_7B_config.json
+deepspeed dream.train.main_deepspeed.py --deepspeed_config /home/apc/DREAM/dream/train/ds_config.json --tmpdir /home/apc/Bingle/data/llava_vicuna_mmt_0/12_data/sharegpt_0_7999_mufp16 --cpdir /home/apc/DREAM/dream/train/vicuna-7b-ckpt --configpath /home/apc/DREAM/dream/train/vicuna_7B_config.json
 ```
 
 ## Evaluation
